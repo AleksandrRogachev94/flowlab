@@ -1,9 +1,9 @@
-import { viridis } from "./viz/colormaps.ts";
-import { Heatmap } from "./viz/heatmap.ts";
+import { viridis } from './viz/colormaps.ts';
+import { Heatmap } from './viz/heatmap.ts';
 
-const canvas = document.querySelector<HTMLCanvasElement>("#view")!;
-const ctx = canvas.getContext("2d")!;
-const readout = document.querySelector<HTMLPreElement>("#readout")!;
+const canvas = document.querySelector<HTMLCanvasElement>('#view')!;
+const ctx = canvas.getContext('2d')!;
+const readout = document.querySelector<HTMLPreElement>('#readout')!;
 
 const N = 64;
 const heatmap = new Heatmap(N, N);
@@ -16,7 +16,7 @@ for (let j = 0; j < N; j++) {
 }
 
 heatmap.draw(grid, ctx, {
-  normalization: { kind: "auto" },
+  normalization: { kind: 'auto' },
   colormap: viridis,
 });
 

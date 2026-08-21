@@ -16,26 +16,44 @@
  *      +-----^-----+
  *        v[i, j]
  *
- * Note the index convention this implies: cell (i,j) is bounded by
- * u[i,j] on its LEFT and u[i+1,j] on its right; v[i,j] below and
- * v[i,j+1] above. Getting this consistent once, here, is what makes the
- * divergence and gradient stencils fall out without sign hunting.
+ * There are two equivalent ways to read the same convention, and both
+ * come up constantly — they are NOT in conflict:
+ *
+ *   Per cell:  cell (i,j) is bounded by u[i,j] LEFT / u[i+1,j] RIGHT,
+ *              and v[i,j] BELOW / v[i,j+1] ABOVE.
+ *   Per face:  u[i,j] separates cell (i-1,j) from cell (i,j);
+ *              v[i,j] separates cell (i,j-1) from cell (i,j).
+ *
+ * i.e. a face's index matches the cell on its HIGH side. Reading the
+ * per-face rule with i+1 substituted recovers the per-cell rule:
+ * u[i+1,j] separates cell (i,j) from (i+1,j) — cell (i,j)'s right face.
+ *
+ *      cell (i-1,j)   cell (i,j)   cell (i+1,j)
+ *    |             |             |             |
+ *   u[i-1,j]     u[i,j]       u[i+1,j]      u[i+2,j]
+ *                   \             /
+ *                    left of (i,j)  right of (i,j)
  */
-
-/** Drives every boundary decision — see Bridson ch. 5. */
-export const enum Cell {
-  Fluid = 0,
-  Air = 1,
-  Solid = 2,
-}
 
 /**
- * Float64Array for the CPU reference; swap to Float32Array to isolate the
- * precision variable in the Phase 1 vs Phase 2 comparison (PLAN.md section 8).
+ * Drives every boundary decision — see Bridson ch. 5.
  */
-export type FieldArray = Float64Array;
+export const Cell = {
+  Fluid: 0,
+  Air: 1,
+  Solid: 2,
+} as const;
+export type Cell = (typeof Cell)[keyof typeof Cell];
+
+/**
+ * Float64Array for the CPU reference; the union with Float32Array exists
+ * so `createFields` can hand back Float32-backed fields to isolate the
+ * precision variable in the Phase 1 vs Phase 2 comparison (PLAN.md §8).
+ */
+export type FieldArray = Float64Array | Float32Array;
 export type FieldCtor = Float64ArrayConstructor | Float32ArrayConstructor;
 
+/** Pure geometry — no arrays. Shared by every field (p, u, v, dye, ...). */
 export interface Grid {
   readonly nx: number;
   readonly ny: number;
@@ -43,22 +61,60 @@ export interface Grid {
   readonly h: number;
 }
 
-// TODO(you) — start here, in roughly this order:
-//
-//   1. `createGrid(nx, ny, h, ctor)` allocating p / u / v / labels.
-//      Allocate ONCE at startup; kernels reuse these buffers forever.
-//
-//   2. Index helpers. Write them as functions first (idxP, idxU, idxV);
-//      inline them later only if profiling says to.
-//         idxP(g, i, j) = i + j * nx
-//         idxU(g, i, j) = ?     // stride is nx + 1
-//         idxV(g, i, j) = ?     // stride is nx
-//
-//   3. A test that pins the conventions down before anything depends on
-//      them: `node --test`. Assert the array lengths, and assert that the
-//      four faces of an interior cell are the indices you expect. This
-//      test is boring and it will save you an evening.
-//
-//   4. Bilinear interpolation `sampleU(g, u, x, y)` — needed by advection,
-//      and the place where the half-cell offsets of the staggered grid
-//      bite. Not needed for Step 1 (projection), so defer it.
+/** The MAC grid's storage. See the header comment for the layout/strides. */
+export interface Fields {
+  p: FieldArray;
+  u: FieldArray;
+  v: FieldArray;
+  label: Uint8Array;
+}
+
+export function createGrid(nx: number, ny: number, h: number): Grid {
+  return { nx, ny, h };
+}
+
+/**
+ * Allocates the four MAC-grid buffers. Zero-initialized, which means every
+ * cell starts labeled Cell.Fluid (0) — solid walls and boundaries are set
+ * up later by scenario code (Step 3), not here.
+ */
+export function createFields(g: Grid, ctor: FieldCtor): Fields {
+  return {
+    p: new ctor(g.nx * g.ny),
+    u: new ctor((g.nx + 1) * g.ny),
+    v: new ctor(g.nx * (g.ny + 1)),
+    label: new Uint8Array(g.nx * g.ny),
+  };
+}
+
+/** Cell-center index: p[i,j] and label[i,j]. Row-major, stride nx. */
+export function idxP(g: Grid, i: number, j: number): number {
+  return i + j * g.nx;
+}
+
+/**
+ * Vertical-face index: u[i,j], the x-velocity on the face between cell
+ * (i-1,j) and cell (i,j). A row of nx cells has nx+1 such faces (one on
+ * each side, like fence posts around fence gaps), so the stride is nx+1,
+ * not nx — that's the one detail that differs from idxP/idxV.
+ */
+export function idxU(g: Grid, i: number, j: number): number {
+  return i + j * (g.nx + 1);
+}
+
+/**
+ * Horizontal-face index: v[i,j], the y-velocity on the face between cell
+ * (i,j-1) and cell (i,j). The stride here is nx (same as idxP) — the +1
+ * shows up in the number of rows (ny+1), not in how many faces fit in one
+ * row, which is why this is NOT the same formula as idxU with x/y swapped.
+ */
+export function idxV(g: Grid, i: number, j: number): number {
+  return i + j * g.nx;
+}
+
+// TODO(you), when advection arrives (Step 2):
+//   Bilinear interpolation `sampleU(g, u, x, y)` / `sampleV(...)` — needed
+//   to look up velocity at an arbitrary point, not just a grid index. This
+//   is where the staggered grid's half-cell face offsets actually bite:
+//   u[i,j] sits at position (i*h, (j+0.5)*h), not (i*h, j*h). Deferred
+//   until advection needs it — projection (Step 1) never samples off-grid.

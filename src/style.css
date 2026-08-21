@@ -1,12 +1,29 @@
-:root { color-scheme: dark; }
+:root {
+  color-scheme: dark;
+}
 body {
   margin: 0;
-  font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font:
+    14px/1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
   background: #14161a;
   color: #d8dde5;
 }
-main { padding: 24px; display: flex; flex-direction: column; gap: 12px; align-items: start; }
-h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
+main {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: start;
+}
+h1 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
 canvas {
   border: 1px solid #2c3138;
   /* the canvas backing store is 512x512; CSS keeps it that size so one
@@ -14,4 +31,9 @@ canvas {
      drawImage inside the renderer, not by CSS. */
   image-rendering: pixelated;
 }
-#readout { margin: 0; color: #8b94a3; min-height: 3em; white-space: pre; }
+#readout {
+  margin: 0;
+  color: #8b94a3;
+  min-height: 3em;
+  white-space: pre;
+}

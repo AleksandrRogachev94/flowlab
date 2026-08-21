@@ -28,11 +28,11 @@ run; ones needing a browser don't.
 ## Rule 2 — kernels: one pass per function, inputs and outputs separate
 
 Every per-cell loop is its own exported function taking input arrays and
-writing to a *distinct* output array:
+writing to a _distinct_ output array:
 
 ```ts
 computeDivergence(u, v, /* out */ div, g);
-jacobiSweep(pIn, div, /* out */ pOut, g);   // caller swaps pIn <-> pOut
+jacobiSweep(pIn, div, /* out */ pOut, g); // caller swaps pIn <-> pOut
 subtractGradient(uIn, vIn, p, /* out */ uOut, vOut, g);
 ```
 
@@ -78,7 +78,7 @@ test is the difference between an obvious bug and a subtle one.
 ## Rule 5 — `Float64Array` via an injected constructor
 
 The grid allocator takes the typed-array constructor as a parameter.
-PLAN.md §8 compares CPU float64 against GPU float32 while *also* changing
+PLAN.md §8 compares CPU float64 against GPU float32 while _also_ changing
 the solver; injecting the constructor makes float32-on-CPU a one-line run,
 which separates the precision variable from the convergence variable.
 

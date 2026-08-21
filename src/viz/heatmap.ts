@@ -1,12 +1,12 @@
-import type { Colormap } from "./colormaps.ts";
+import type { Colormap } from './colormaps.ts';
 
 export type Normalization =
   /** map [min,max] of this frame's data onto [0,1] */
-  | { kind: "auto" }
+  | { kind: 'auto' }
   /** map [-m,m] onto [0,1] where m = max|value|, so 0 lands exactly at 0.5 */
-  | { kind: "symmetric" }
+  | { kind: 'symmetric' }
   /** fixed range, so colors are comparable across frames */
-  | { kind: "fixed"; min: number; max: number };
+  | { kind: 'fixed'; min: number; max: number };
 
 export interface DrawOptions {
   colormap: Colormap;
@@ -23,7 +23,7 @@ export function computeRange(
   normalization: Normalization,
 ): { lo: number; hi: number } {
   switch (normalization.kind) {
-    case "auto": {
+    case 'auto': {
       let lo = Infinity;
       let hi = -Infinity;
       for (let i = 0; i < field.length; i++) {
@@ -33,7 +33,7 @@ export function computeRange(
       }
       return { lo, hi };
     }
-    case "symmetric": {
+    case 'symmetric': {
       // Track magnitude in its own variable — assigning the signed value
       // into the bound directly (as an earlier version of this did) lets a
       // negative value poison the running max, since abs(v) >= 0 always
@@ -45,7 +45,7 @@ export function computeRange(
       }
       return { lo: -m, hi: m };
     }
-    case "fixed":
+    case 'fixed':
       return { lo: normalization.min, hi: normalization.max };
   }
 }
@@ -74,12 +74,12 @@ export class Heatmap {
     this.nx = nx;
     this.ny = ny;
 
-    this.buf = document.createElement("canvas");
+    this.buf = document.createElement('canvas');
     this.buf.width = nx;
     this.buf.height = ny;
 
-    const ctx = this.buf.getContext("2d", { willReadFrequently: false });
-    if (!ctx) throw new Error("2d context unavailable");
+    const ctx = this.buf.getContext('2d', { willReadFrequently: false });
+    if (!ctx) throw new Error('2d context unavailable');
     this.bufCtx = ctx;
 
     this.img = ctx.createImageData(nx, ny);
@@ -91,11 +91,7 @@ export class Heatmap {
   /**
    * Fill `this.img.data` from `field`, then blit scaled into `dest`.
    */
-  draw(
-    field: Float64Array,
-    dest: CanvasRenderingContext2D,
-    opts: DrawOptions,
-  ): void {
+  draw(field: Float64Array, dest: CanvasRenderingContext2D, opts: DrawOptions): void {
     const { lo, hi } = computeRange(field, opts.normalization);
     this.lastMin = lo;
     this.lastMax = hi;

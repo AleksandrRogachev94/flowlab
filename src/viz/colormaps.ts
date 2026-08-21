@@ -11,7 +11,8 @@ type Anchor = readonly [pos: number, r: number, g: number, b: number];
 /** Piecewise-linear interpolation over evenly-or-unevenly spaced anchors. */
 function rampFromAnchors(anchors: readonly Anchor[]): Colormap {
   return (t, out, i) => {
-    if (!(t > 0)) t = 0; // also catches NaN
+    if (!(t > 0))
+      t = 0; // also catches NaN
     else if (t > 1) t = 1;
 
     let k = 1;
