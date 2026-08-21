@@ -102,7 +102,7 @@ export class Heatmap {
     for (let j = 0; j < this.ny; j++) {
       const row = this.ny - 1 - j;
       for (let i = 0; i < this.nx; i++) {
-        const t = !isSameHiLo ? (field[i + j * this.nx] - lo) / (hi - lo) : 0.0;
+        const t = !isSameHiLo ? (field[i + j * this.nx] - lo) / (hi - lo) : 0.5;
         opts.colormap(t, this.img.data, (i + row * this.nx) * 4);
       }
     }

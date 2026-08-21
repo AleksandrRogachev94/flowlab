@@ -51,13 +51,22 @@ Why, in order of how soon it bites:
    ports mechanically; code that isn't gets rewritten, and then PLAN.md §8
    is comparing two different programs instead of two solvers.
 
-This is the same distinction as Jacobi (reads the old iterate everywhere —
-two arrays, parallel) vs. Gauss-Seidel (reads partially-updated values —
-one array, sequential, converges faster). Read/write separation is a
-correctness property on both CPU and GPU, not a GPU quirk.
+**The pressure solver is the deliberate exception.** Gauss-Seidel reads
+partially-updated values and writes `p` in place — that is not a bug, it is
+why it converges 2x faster than Jacobi, and it makes the sweep *less* code
+(one array, no ping-pong, no swap). Jacobi is skipped entirely: it is both
+slower and more machinery.
 
-The exception is red-black Gauss-Seidel in Phase 2, which is in-place by
-design; the checkerboard split is what makes it safe.
+Consequences worth planning around:
+
+- Adding SOR is one line: `p = (1-w)*p_old + w*p_gs`, with w ~ 1.9 at 64x64.
+  That changes the convergence class from O(n^2) to O(n) iterations.
+- Plain GS -> red-black GS (the Phase 2 GPU solver) is a small change: add a
+  color parameter, run two passes. A cell's four neighbours in the 5-point
+  stencil are always the opposite colour, so each half-sweep is fully
+  parallel while staying in place.
+
+Every *other* kernel keeps strict read/write separation.
 
 Cost: extra buffers and a swap dance. Allocate once at startup; at 64x64
 the memory is irrelevant.
