@@ -126,9 +126,68 @@ export function isSolid(g: Grid, label: Uint8Array, i: number, j: number): boole
   return i < 0 || j < 0 || i >= g.nx || j >= g.ny || label[idxP(g, i, j)] === Cell.Solid;
 }
 
-// TODO(you), when advection arrives (Step 2):
-//   Bilinear interpolation `sampleU(g, u, x, y)` / `sampleV(...)` — needed
-//   to look up velocity at an arbitrary point, not just a grid index. This
-//   is where the staggered grid's half-cell face offsets actually bite:
-//   u[i,j] sits at position (i*h, (j+0.5)*h), not (i*h, j*h). Deferred
-//   until advection needs it — projection (Step 1) never samples off-grid.
+/**
+ * Splits a continuous local-index coordinate into a base index i0 and a
+ * fraction f, clamped so i0 and i0+1 are both valid.
+ *
+ * The two bounds differ on purpose: the POSITION clamps to count-1, so an
+ * out-of-domain point interpolates at the edge instead of extrapolating off
+ * it; the INDEX clamps to count-2, so i0+1 stays in range at the far edge,
+ * where the position clamp lands exactly on count-1.
+ *
+ * Clamping happens here, after the caller applies the half-cell offset —
+ * clamping raw x/y misses sampleU at y=0, which needs floor(-0.5) = -1.
+ */
+function clampedAxis(pos: number, count: number): { i0: number; f: number } {
+  const clamped = Math.min(Math.max(pos, 0), count - 1);
+  const i0 = Math.min(Math.floor(clamped), count - 2);
+  return { i0, f: clamped - i0 };
+}
+
+/** Bilinear blend of four corners, as nested lerps: 3 multiplies, not 8. */
+function bilerp(
+  v00: number,
+  v10: number,
+  v01: number,
+  v11: number,
+  fx: number,
+  fy: number,
+): number {
+  const lo = v00 + fx * (v10 - v00);
+  const hi = v01 + fx * (v11 - v01);
+  return lo + fy * (hi - lo);
+}
+
+/**
+ * Bilinear sample of u at an arbitrary world-space point. u[i,j] sits at
+ * (i*h, (j+0.5)*h) — hence the -0.5 on y only — and has nx+1 by ny values.
+ */
+export function sampleU(g: Grid, u: FieldArray, x: number, y: number): number {
+  const { i0, f: fx } = clampedAxis(x / g.h, g.nx + 1);
+  const { i0: j0, f: fy } = clampedAxis(y / g.h - 0.5, g.ny);
+  return bilerp(
+    u[idxU(g, i0, j0)],
+    u[idxU(g, i0 + 1, j0)],
+    u[idxU(g, i0, j0 + 1)],
+    u[idxU(g, i0 + 1, j0 + 1)],
+    fx,
+    fy,
+  );
+}
+
+/**
+ * Bilinear sample of v at an arbitrary world-space point. v[i,j] sits at
+ * ((i+0.5)*h, j*h) — the offset is on x here — and has nx by ny+1 values.
+ */
+export function sampleV(g: Grid, v: FieldArray, x: number, y: number): number {
+  const { i0, f: fx } = clampedAxis(x / g.h - 0.5, g.nx);
+  const { i0: j0, f: fy } = clampedAxis(y / g.h, g.ny + 1);
+  return bilerp(
+    v[idxV(g, i0, j0)],
+    v[idxV(g, i0 + 1, j0)],
+    v[idxV(g, i0, j0 + 1)],
+    v[idxV(g, i0 + 1, j0 + 1)],
+    fx,
+    fy,
+  );
+}
