@@ -112,6 +112,20 @@ export function idxV(g: Grid, i: number, j: number): number {
   return i + j * g.nx;
 }
 
+/**
+ * Is cell (i,j) unavailable to couple with — either a labeled Solid, or
+ * outside the domain entirely? Outside-as-solid is how the closed box gets
+ * its walls without a ghost ring around the array.
+ *
+ * The bounds check MUST run before the label lookup: idxP wraps at row
+ * boundaries (it's just i + j*nx), so an out-of-range (i,j) can silently
+ * alias a different, valid cell instead of failing loudly. Checking bounds
+ * first is what prevents that.
+ */
+export function isSolid(g: Grid, label: Uint8Array, i: number, j: number): boolean {
+  return i < 0 || j < 0 || i >= g.nx || j >= g.ny || label[idxP(g, i, j)] === Cell.Solid;
+}
+
 // TODO(you), when advection arrives (Step 2):
 //   Bilinear interpolation `sampleU(g, u, x, y)` / `sampleV(...)` — needed
 //   to look up velocity at an arbitrary point, not just a grid index. This
