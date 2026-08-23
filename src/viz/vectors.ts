@@ -39,6 +39,14 @@ export interface VectorOptions {
   color: string;
   /** arrowhead size in pixels; 0 draws bare line segments */
   headSize: number;
+  /**
+   * Speed mapping to a full-length arrow. Pass the frame's max to make length
+   * RELATIVE, keeping the picture's shape as the flow decays; omit for
+   * absolute lengths, which visibly shrink. Match this to the heatmap's
+   * normalization — mixing the two makes a decaying flow look frozen while
+   * its arrows quietly shrink away.
+   */
+  refSpeed?: number;
 }
 
 export const defaultVectorOptions: VectorOptions = {
@@ -104,7 +112,10 @@ function pathArrow(
   const speed = Math.hypot(vx, vy);
   if (speed < 1e-12) return; // avoids 0/0 in the direction below
 
-  const shown = opts.scaling === 'unit' ? 1 : opts.scaling === 'sqrt' ? Math.sqrt(speed) : speed;
+  // refSpeed maps speed into [0,1] first, so `scale` becomes the pixel length
+  // of the fastest arrow rather than a raw pixels-per-unit-speed factor.
+  const t = opts.refSpeed && opts.refSpeed > 0 ? speed / opts.refSpeed : speed;
+  const shown = opts.scaling === 'unit' ? 1 : opts.scaling === 'sqrt' ? Math.sqrt(t) : t;
   const k = (shown / speed) * opts.scale;
 
   const [x1, y1] = gridToScreen(g, gx, gy, w, h);

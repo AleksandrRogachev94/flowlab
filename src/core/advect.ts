@@ -2,29 +2,23 @@ import { idxU, idxV, isSolid, sampleU, sampleV, type FieldArray, type Grid } fro
 
 /**
  * Semi-Lagrangian advection of velocity: u^{n+1}(x) = u^n(x - dt * u).
+ * Backtrace each face to where its fluid came from and interpolate there.
+ * Unconditionally stable — every output is a bilinear blend of inputs, so it
+ * cannot exceed the input range at any dt. The price is dissipation.
  *
- * For each face, backtrace to where the fluid arriving there came from and
- * interpolate the old field at that point. Unconditionally stable: the answer
- * is a bilinear blend of existing values, so it cannot exceed the input range
- * however large dt is. The price is numerical dissipation.
- *
- * The backtrace is RK2 (midpoint), not forward Euler:
+ * RK2 (midpoint), not forward Euler:
  *   mid  = x - (dt/2) * vel(x)
  *   prev = x - dt * vel(mid)
- * Both velocity components are needed at each stage even when advecting u
- * alone, since the backtrace moves diagonally. Only the component living at
- * the face itself is read directly; the other is interpolated.
+ * Both components are needed at each stage even when advecting u alone, since
+ * the backtrace moves diagonally; only the one living at the face is exact.
  *
  * NOT in-place (Rule 2): u advects itself, so uIn must survive the pass.
  *
- * @param label per-cell Fluid/Air/Solid. A face touching a solid keeps its
- *              prescribed velocity, COPIED through rather than skipped — uOut
- *              is a separate buffer and would otherwise keep stale ping-pong
- *              data. Copying also preserves a moving wall's velocity, which
- *              zeroing would destroy. These bounds deliberately match
- *              subtractGradient's, so advection and projection own exactly the
- *              same set of faces; a face advection wrote but projection cannot
- *              correct would leak mass through the wall forever.
+ * @param label a face touching a solid keeps its prescribed velocity, COPIED
+ *              through rather than skipped — uOut is a separate buffer and
+ *              would otherwise keep stale ping-pong data. Bounds match
+ *              subtractGradient's, so a face advection writes is always one
+ *              projection can correct.
  */
 export function advectVelocity(
   g: Grid,

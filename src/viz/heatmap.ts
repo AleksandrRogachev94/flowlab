@@ -11,6 +11,12 @@ export type Normalization =
 export interface DrawOptions {
   colormap: Colormap;
   normalization: Normalization;
+  /**
+   * Bilinear-upscale the grid-resolution buffer (GPU-side, free). Smooth
+   * gradients for presentation; leave off to see exact cell boundaries when
+   * debugging.
+   */
+  smooth?: boolean;
 }
 
 /**
@@ -109,7 +115,7 @@ export class Heatmap {
 
     // Blit
     this.bufCtx.putImageData(this.img, 0, 0);
-    dest.imageSmoothingEnabled = false; // crisp cells for debugging
+    dest.imageSmoothingEnabled = opts.smooth ?? false;
     dest.drawImage(this.buf, 0, 0, dest.canvas.width, dest.canvas.height);
   }
 }

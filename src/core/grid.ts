@@ -128,15 +128,13 @@ export function isSolid(g: Grid, label: Uint8Array, i: number, j: number): boole
 
 /**
  * Splits a continuous local-index coordinate into a base index i0 and a
- * fraction f, clamped so i0 and i0+1 are both valid.
+ * fraction f, clamped so i0 and i0+1 are both valid. The two bounds differ on
+ * purpose: the POSITION clamps to count-1 so an out-of-domain point
+ * interpolates at the edge rather than extrapolating off it, the INDEX to
+ * count-2 so i0+1 stays in range there.
  *
- * The two bounds differ on purpose: the POSITION clamps to count-1, so an
- * out-of-domain point interpolates at the edge instead of extrapolating off
- * it; the INDEX clamps to count-2, so i0+1 stays in range at the far edge,
- * where the position clamp lands exactly on count-1.
- *
- * Clamping happens here, after the caller applies the half-cell offset —
- * clamping raw x/y misses sampleU at y=0, which needs floor(-0.5) = -1.
+ * Clamping happens after the caller applies the half-cell offset — clamping
+ * raw x/y misses sampleU at y=0, which needs floor(-0.5) = -1.
  */
 function clampedAxis(pos: number, count: number): { i0: number; f: number } {
   const clamped = Math.min(Math.max(pos, 0), count - 1);

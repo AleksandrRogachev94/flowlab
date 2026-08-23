@@ -31,6 +31,23 @@ canvas {
      drawImage inside the renderer, not by CSS. */
   image-rendering: pixelated;
 }
+.controls {
+  display: flex;
+  gap: 8px;
+}
+button {
+  font: inherit;
+  color: #d8dde5;
+  background: #1e222a;
+  border: 1px solid #2c3138;
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover {
+  background: #262b34;
+  border-color: #3a4250;
+}
 #readout {
   margin: 0;
   color: #8b94a3;

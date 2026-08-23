@@ -1,45 +1,64 @@
-import { computeDivergence } from './core/divergence.ts';
-import { createFields, createGrid } from './core/grid.ts';
-import { solvePressure } from './core/pressure.ts';
-import { subtractGradient } from './core/subtractGradient.ts';
-import { addGradient, addRotational } from './scenes/testFields.ts';
-import { viridis, coolwarm } from './viz/colormaps.ts';
-import { Heatmap } from './viz/heatmap.ts';
-import { defaultVectorOptions, drawVectors } from './viz/vectors.ts';
+import { Simulation, type Seed } from './core/simulation.ts';
+import { addVortexCluster, addVortexPair } from './scenes/testFields.ts';
+import { FieldView, VIEWS } from './viz/fieldView.ts';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#view')!;
 const ctx = canvas.getContext('2d')!;
 const readout = document.querySelector<HTMLPreElement>('#readout')!;
 
-const N = 64; // grid dimensions.
-const H = 1 / N; // unit square — testFields.ts assumes h = 1/nx.
-const RHO = 1.0;
-const DT = 1.0;
-const heatmap = new Heatmap(N, N);
+/**
+ * 'dipole'  self-propelling pair — the clearest check that advection moves
+ *           things the right way at all.
+ * 'cluster' interacting vortices that stretch filaments and merge — the scene
+ *           for comparing schemes. Deterministic, so two runs are comparable.
+ */
+const SCENES: { name: string; seed: Seed }[] = [
+  { name: 'dipole', seed: addVortexPair },
+  { name: 'cluster', seed: addVortexCluster },
+];
 
-const g = createGrid(N, N, H);
-const f = createFields(g, Float64Array);
+const sim = new Simulation(128);
+const fieldView = new FieldView(sim.g);
 
-addRotational(g, f.u, f.v);
-addGradient(g, f.u, f.v);
+let sceneIndex = 0;
+let viewIndex = 0;
 
-const div = new Float64Array(f.p.length);
-computeDivergence(g, f.u, f.v, div);
+function restart(): void {
+  sim.reset(SCENES[sceneIndex].seed);
+}
+function toggleView(): void {
+  viewIndex = (viewIndex + 1) % VIEWS.length;
+}
+function nextScene(): void {
+  sceneIndex = (sceneIndex + 1) % SCENES.length;
+  restart();
+}
+restart();
 
-const scale = (RHO * H * H) / DT;
-const gradScale = DT / (RHO * H);
-solvePressure(g, f.p, div, f.label, scale, 1000, 1.9);
-subtractGradient(g, f.p, f.u, f.v, f.label, gradScale);
+const onClick = (id: string, run: () => void): void =>
+  document.querySelector<HTMLButtonElement>(`#${id}`)!.addEventListener('click', run);
+onClick('restart', restart);
+onClick('toggleView', toggleView);
+onClick('nextScene', nextScene);
 
-// re-compute divergence
-computeDivergence(g, f.u, f.v, div);
-
-heatmap.draw(div, ctx, {
-  normalization: { kind: 'symmetric' },
-  colormap: coolwarm,
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') restart();
+  if (e.key === 'd' || e.key === 'D') toggleView();
+  if (e.key === 's' || e.key === 'S') nextScene();
 });
-drawVectors(ctx, g, f.u, f.v, { ...defaultVectorOptions, mode: 'cell' });
 
-// lastMin/lastMax exist specifically because the picture alone can't tell
-// you whether a field converged — only the numbers can.
-readout.textContent = `Divergence range: [${heatmap.lastMin.toFixed(4)}, ${heatmap.lastMax.toFixed(4)}]`;
+function frame(): void {
+  sim.step();
+  const { maxSpeed, divMax } = fieldView.draw(ctx, sim, VIEWS[viewIndex]);
+
+  readout.textContent =
+    `scene: ${SCENES[sceneIndex].name} (S) | view: ${VIEWS[viewIndex]} (D) | ` +
+    `t = ${sim.time.toFixed(2)} | max speed: ${maxSpeed.toFixed(4)}\n` +
+    `dt = ${sim.dt.toExponential(2)} (CFL ${sim.cfl.toFixed(2)}) | ` +
+    `SOR sweeps: ${sim.iters}/${sim.params.pressureIters} | ` +
+    `div residual: ±${divMax.toExponential(1)}`;
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);

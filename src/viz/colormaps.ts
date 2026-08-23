@@ -58,6 +58,34 @@ export const coolwarm = rampFromAnchors([
   [1.0, 180, 4, 38],
 ]);
 
+/**
+ * Magnitude map for the live view on a dark page — presentation counterpart
+ * of viridis, which stays the choice for reading exact values. Stops short of
+ * white on purpose: white arrows draw on top, and a ramp reaching 255 hides
+ * them exactly where the flow is most interesting.
+ */
+export const ocean = rampFromAnchors([
+  [0.0, 8, 12, 38],
+  [0.3, 24, 55, 130],
+  [0.6, 45, 110, 205],
+  [0.85, 80, 155, 235],
+  [1.0, 125, 190, 245],
+]);
+
+/**
+ * Diverging with a DARK centre: cool negative, near-black zero, warm positive.
+ * For signed fields under a white arrow overlay. coolwarm puts near-white at
+ * zero, and in a field like vorticity most of the domain IS near zero, so the
+ * arrows vanish over exactly the calm regions where they carry the meaning.
+ */
+export const iceFire = rampFromAnchors([
+  [0.0, 130, 225, 255],
+  [0.25, 40, 130, 215],
+  [0.5, 16, 18, 24],
+  [0.75, 225, 105, 45],
+  [1.0, 255, 215, 130],
+]);
+
 /** Greyscale, for when you want to see raw structure without hue bias. */
 export const grey = rampFromAnchors([
   [0.0, 0, 0, 0],
