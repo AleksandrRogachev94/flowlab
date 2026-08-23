@@ -11,10 +11,15 @@
  * pressure solve requires. Frequencies differ on purpose: same frequency
  * makes curl and grad exact negatives that cancel to nothing.
  *
- * Both functions ADD into u/v — zero the arrays first for a fresh field.
+ * Every function here ADDs into its output — zero the arrays first for a fresh
+ * field. That is what lets a scene be composed from several seeds.
+ *
+ * addDyeDisk is the odd one out: it seeds a passive tracer, not velocity, and
+ * so verifies nothing on its own. It lives here because it is scene setup and
+ * shares the same world-coordinate conventions.
  */
 
-import { idxU, idxV, type FieldArray, type Grid } from '../core/grid.ts';
+import { idxP, idxU, idxV, type FieldArray, type Grid } from '../core/grid.ts';
 
 const PI = Math.PI;
 
@@ -46,6 +51,70 @@ export function addCurlOfStream(
 /** Divergence-free part: u = curl(psi), psi = sin(pi x) sin(pi y) at corners. */
 export function addRotational(g: Grid, u: FieldArray, v: FieldArray, amp = 1): void {
   addCurlOfStream(g, u, v, (i, j) => Math.sin(PI * i * g.h) * Math.sin(PI * j * g.h), amp);
+}
+
+/**
+ * A disk of dye at concentration 1, centred in the unit square by default.
+ * Passive tracer: it shows where the fluid GOES, which no view of the velocity
+ * field does directly, and its edge is the readout for advection's dissipation.
+ *
+ * Radius and centre are in WORLD units, like every other seed here, rather
+ * than in cells — a cell-quantized radius changes the shape as N changes,
+ * which makes two resolutions non-comparable.
+ *
+ * The edge ramps over one cell instead of stepping 1 -> 0. A hard step is
+ * jagged at the grid scale, and its corners are precisely the sub-cell
+ * features semi-Lagrangian advection erases in the first few steps — so the
+ * scheme gets blamed for smoothing what was aliasing in the seed. One cell of
+ * ramp is narrow enough that the blur you then watch grow is genuinely the
+ * scheme's.
+ *
+ * ADDs, like the velocity seeds: overlapping disks sum past 1.
+ */
+export function addDyeDisk(g: Grid, dye: FieldArray, r = 0.15, cx = 0.5, cy = 0.5): void {
+  for (let j = 0; j < g.ny; j++) {
+    const y = (j + 0.5) * g.h;
+    for (let i = 0; i < g.nx; i++) {
+      const x = (i + 0.5) * g.h;
+      // t crosses 0.5 exactly at the radius, so the ramp straddles it.
+      const t = Math.min(Math.max((r - Math.hypot(x - cx, y - cy)) / g.h + 0.5, 0), 1);
+      dye[idxP(g, i, j)] += t * t * (3 - 2 * t); // smoothstep
+    }
+  }
+}
+
+/**
+ * One centred disk, written identically to every channel. Identical data
+ * carried by identical velocity stays identical, so this renders as pure
+ * greyscale: the classic single-dye picture, and the control for judging what
+ * the triad's colour mixing is actually worth.
+ *
+ * It does spend three advections carrying one scalar's worth of information.
+ * That is the deliberate trade — the step loop and the RGB compositor stay
+ * branch-free, and dye advection is negligible beside the pressure solve.
+ */
+export function addDyeMono(g: Grid, dye: FieldArray[], r = 0.15): void {
+  for (const c of dye) addDyeDisk(g, c, r);
+}
+
+/**
+ * One disk per dye channel, on a triangle about the centre and sized to
+ * OVERLAP their neighbours. Displayed as RGB, the three pairwise overlaps read
+ * as yellow, cyan and magenta from the first frame.
+ *
+ * The overlaps are the instrument. A single channel only ever shows an edge
+ * softening, which is hard to judge; interleaved channels mix to a colour that
+ * was never seeded, so filaments thinner than a cell announce themselves as
+ * the picture desaturating toward grey. That is numerical diffusion made
+ * legible — and the thing to watch when a higher-order scheme lands.
+ */
+export function addDyeTriad(g: Grid, dye: FieldArray[], r = 0.13, d = 0.12): void {
+  for (let c = 0; c < dye.length; c++) {
+    // Start at 90 deg so the red disk sits on top, then step by a full turn
+    // divided between the channels.
+    const a = PI / 2 + (2 * PI * c) / dye.length;
+    addDyeDisk(g, dye[c], r, 0.5 + d * Math.cos(a), 0.5 + d * Math.sin(a));
+  }
 }
 
 /**

@@ -1,4 +1,14 @@
-import { idxU, idxV, isSolid, sampleU, sampleV, type FieldArray, type Grid } from './grid.ts';
+import {
+  idxP,
+  idxU,
+  idxV,
+  isSolid,
+  sampleP,
+  sampleU,
+  sampleV,
+  type FieldArray,
+  type Grid,
+} from './grid.ts';
 
 /**
  * Semi-Lagrangian advection of velocity: u^{n+1}(x) = u^n(x - dt * u).
@@ -63,6 +73,51 @@ export function advectVelocity(
       const prevX = x - dt * sampleU(g, uIn, midX, midY);
       const prevY = y - dt * sampleV(g, vIn, midX, midY);
       vOut[k] = sampleV(g, vIn, prevX, prevY);
+    }
+  }
+}
+
+/**
+ * Semi-Lagrangian advection of a PASSIVE cell-centered scalar — dye here,
+ * later smoke or temperature: q^{n+1}(x) = q^n(x - dt * u). Same RK2 backtrace
+ * as advectVelocity above, but the carried field is not the carrying field, so
+ * u/v are read-only and any number of scalars can ride one velocity.
+ *
+ * Pass the POST-projection velocity: a divergence-free carrier neither
+ * concentrates nor thins the tracer, while u* invents sinks and sources
+ * wherever it compresses.
+ *
+ * NOT in-place (Rule 2). Solid cells copy through as in advectVelocity, since
+ * qOut is a separate ping-pong buffer and skipping them leaves stale data.
+ */
+export function advectScalar(
+  g: Grid,
+  u: FieldArray,
+  v: FieldArray,
+  qIn: FieldArray,
+  qOut: FieldArray,
+  label: Uint8Array,
+  dt: number,
+): void {
+  const h = g.h;
+  const halfDt = 0.5 * dt;
+
+  for (let j = 0; j < g.ny; j++) {
+    const y = (j + 0.5) * h;
+    for (let i = 0; i < g.nx; i++) {
+      const k = idxP(g, i, j);
+      if (isSolid(g, label, i, j)) {
+        qOut[k] = qIn[k];
+        continue;
+      }
+      const x = (i + 0.5) * h;
+      // Both stages interpolate both components: a cell center stores neither
+      // u nor v, where advectVelocity gets one of them exact for free.
+      const midX = x - halfDt * sampleU(g, u, x, y);
+      const midY = y - halfDt * sampleV(g, v, x, y);
+      const prevX = x - dt * sampleU(g, u, midX, midY);
+      const prevY = y - dt * sampleV(g, v, midX, midY);
+      qOut[k] = sampleP(g, qIn, prevX, prevY);
     }
   }
 }

@@ -2,7 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGrid, createFields, idxU, idxV } from '../core/grid.ts';
 import { computeDivergence } from '../core/divergence.ts';
-import { addRotational, addGradient, addVortexPair, addVortexCluster } from './testFields.ts';
+import {
+  addRotational,
+  addGradient,
+  addVortexPair,
+  addVortexCluster,
+  addDyeTriad,
+  addDyeMono,
+} from './testFields.ts';
 
 const N = 32;
 const setup = () => {
@@ -144,4 +151,49 @@ test('addVortexCluster leaks only negligibly through the walls', () => {
     worst = Math.max(worst, Math.abs(f.v[idxV(g, i, 0)]), Math.abs(f.v[idxV(g, i, g.ny)]));
   }
   assert.ok(worst < 1e-4, `max wall-normal velocity = ${worst}`);
+});
+
+test('addDyeTriad seeds every channel, in a different place', () => {
+  const { g, f } = setup();
+  addDyeTriad(g, f.dye);
+
+  // Each channel must carry a real disk. A loop that seeded only dye[0], or
+  // stacked all three disks at the same centre, renders as plausible-looking
+  // dye and is easy to miss by eye.
+  const peaks = f.dye.map((c) => c.indexOf(Math.max(...c)));
+  for (let c = 0; c < f.dye.length; c++) {
+    assert.ok(Math.max(...f.dye[c]) > 0.99, `channel ${c} has no fully saturated cell`);
+    for (let other = 0; other < c; other++) {
+      assert.notEqual(peaks[c], peaks[other], `channels ${c} and ${other} peak in the same cell`);
+    }
+  }
+});
+
+test('addDyeTriad disks overlap, and stay in [0, 1] where they do', () => {
+  const { g, f } = setup();
+  addDyeTriad(g, f.dye);
+
+  // The overlaps are the whole point of the triad — they are what show mixing.
+  // But addDyeDisk ADDs, so a triad packed too tightly would push a channel
+  // past 1 and clip against the fixed display range instead of blending.
+  let mixed = 0;
+  for (let k = 0; k < f.p.length; k++) {
+    if (f.dye.filter((c) => c[k] > 0.01).length >= 2) mixed++;
+    for (const c of f.dye) assert.ok(c[k] >= 0 && c[k] <= 1, `cell ${k} = ${c[k]} outside [0,1]`);
+  }
+  assert.ok(mixed > 0, 'no cell carries two dyes: the disks never overlap');
+});
+
+test('addDyeMono fills every channel identically, so it renders as grey', () => {
+  const { g, f } = setup();
+  addDyeMono(g, f.dye);
+
+  // The whole premise of the mono tracer: three equal channels composite to
+  // pure greyscale. Any per-channel difference here would tint the picture and
+  // fake exactly the mixing signal the triad is supposed to have a monopoly on.
+  for (let k = 0; k < f.p.length; k++) {
+    assert.equal(f.dye[1][k], f.dye[0][k], `channel 1 differs at cell ${k}`);
+    assert.equal(f.dye[2][k], f.dye[0][k], `channel 2 differs at cell ${k}`);
+  }
+  assert.ok(Math.max(...f.dye[0]) > 0.99, 'no fully saturated cell');
 });

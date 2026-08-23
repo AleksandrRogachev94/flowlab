@@ -9,9 +9,13 @@ import { cellVelocity, defaultVectorOptions, drawVectors } from './vectors.ts';
  * 'vorticity'  signed curl — the analysis view. Speed is smooth and hides
  *              structure; vorticity concentrates at cores and shear layers.
  * 'speed'      magnitude — reads well as a picture, weakest for structure.
+ * 'dye'        three passive tracers composited as RGB — the only view showing
+ *              where fluid GOES rather than how fast it moves. Colours that
+ *              were never seeded mark where channels have interleaved below
+ *              the grid scale, which is advection's dissipation made visible.
  * 'divergence' projection residual — the debug view.
  */
-export const VIEWS = ['vorticity', 'speed', 'divergence'] as const;
+export const VIEWS = ['dye', 'vorticity', 'speed', 'divergence'] as const;
 export type View = (typeof VIEWS)[number];
 
 /** What the frame was normalized by. The picture is rescaled every frame, so
@@ -69,6 +73,12 @@ export class FieldView {
         colormap: ocean,
         smooth: true,
       });
+    } else if (view === 'dye') {
+      // Straight to RGB — see Heatmap.drawRGB. No colormap, and no
+      // normalization: dye is seeded at 1 and only dissipates, so the absolute
+      // brightness IS the measurement.
+      const [r, gr, b] = f.dye;
+      this.heatmap.drawRGB(r, gr, b, ctx, { smooth: true });
     } else {
       // coolwarm keeps its near-white zero here: the debug question is "is
       // anything nonzero", and specks of colour read fastest against white.

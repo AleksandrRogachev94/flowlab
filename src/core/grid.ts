@@ -61,12 +61,25 @@ export interface Grid {
   readonly h: number;
 }
 
+/**
+ * Dye channels, composited as RGB for display.
+ *
+ * Three INDEPENDENT scalars sharing one velocity, not a vector quantity —
+ * nothing couples them and each is advected on its own. The reason for three
+ * is diagnostic: where two dyes have interleaved below the grid scale they mix
+ * to a new colour, so advection error becomes visible as muddying rather than
+ * only as a fading edge. A single channel cannot show that.
+ */
+export const DYE_CHANNELS = 3;
+
 /** The MAC grid's storage. See the header comment for the layout/strides. */
 export interface Fields {
   p: FieldArray;
   u: FieldArray;
   v: FieldArray;
   label: Uint8Array;
+  /** DYE_CHANNELS cell-centered scalars, each nx * ny. */
+  dye: FieldArray[];
 }
 
 export function createGrid(nx: number, ny: number, h: number): Grid {
@@ -84,6 +97,7 @@ export function createFields(g: Grid, ctor: FieldCtor): Fields {
     u: new ctor((g.nx + 1) * g.ny),
     v: new ctor(g.nx * (g.ny + 1)),
     label: new Uint8Array(g.nx * g.ny),
+    dye: Array.from({ length: DYE_CHANNELS }, () => new ctor(g.nx * g.ny)),
   };
 }
 
@@ -185,6 +199,31 @@ export function sampleV(g: Grid, v: FieldArray, x: number, y: number): number {
     v[idxV(g, i0 + 1, j0)],
     v[idxV(g, i0, j0 + 1)],
     v[idxV(g, i0 + 1, j0 + 1)],
+    fx,
+    fy,
+  );
+}
+
+/**
+ * Bilinear sample of any CELL-CENTERED field (p, dye, ...) at a world-space
+ * point, interpolating inside the square whose corners are the four
+ * surrounding cell CENTERS.
+ *
+ * The -0.5 on both axes is the world -> index-coordinate conversion that
+ * clampedAxis expects, i.e. one where an integer lands exactly on a data
+ * point. The world origin sits on a cell CORNER while the data sits at cell
+ * CENTERS, so center i is at (i+0.5)*h and the inverse is x/h - 0.5. Both axes
+ * need it here precisely BECAUSE the field is collocated; sampleU skips it in
+ * x only because u's data does sit on the origin line.
+ */
+export function sampleP(g: Grid, q: FieldArray, x: number, y: number): number {
+  const { i0, f: fx } = clampedAxis(x / g.h - 0.5, g.nx);
+  const { i0: j0, f: fy } = clampedAxis(y / g.h - 0.5, g.ny);
+  return bilerp(
+    q[idxP(g, i0, j0)],
+    q[idxP(g, i0 + 1, j0)],
+    q[idxP(g, i0, j0 + 1)],
+    q[idxP(g, i0 + 1, j0 + 1)],
     fx,
     fy,
   );

@@ -1,3 +1,4 @@
+import type { FieldArray } from '../core/grid.ts';
 import type { Colormap } from './colormaps.ts';
 
 export type Normalization =
@@ -25,7 +26,7 @@ export interface DrawOptions {
  * can be unit tested directly with node --test.
  */
 export function computeRange(
-  field: Float64Array,
+  field: FieldArray,
   normalization: Normalization,
 ): { lo: number; hi: number } {
   switch (normalization.kind) {
@@ -97,7 +98,7 @@ export class Heatmap {
   /**
    * Fill `this.img.data` from `field`, then blit scaled into `dest`.
    */
-  draw(field: Float64Array, dest: CanvasRenderingContext2D, opts: DrawOptions): void {
+  draw(field: FieldArray, dest: CanvasRenderingContext2D, opts: DrawOptions): void {
     const { lo, hi } = computeRange(field, opts.normalization);
     this.lastMin = lo;
     this.lastMax = hi;
@@ -113,9 +114,50 @@ export class Heatmap {
       }
     }
 
-    // Blit
+    this.blit(dest, opts.smooth);
+  }
+
+  /**
+   * Composite three fields as the R, G and B channels of one image, with no
+   * colormap involved: for independent dyes the MIXING is the signal, and any
+   * single-channel ramp would have to discard it to produce one number.
+   *
+   * Values are read as concentrations on [0,1] against a black background.
+   * Deliberately NOT normalized, unlike draw(): dye only dissipates, so
+   * rescaling per frame would hide the decay. Out-of-range values are clamped
+   * (and rounded) for free by Uint8ClampedArray.
+   */
+  drawRGB(
+    r: FieldArray,
+    g: FieldArray,
+    b: FieldArray,
+    dest: CanvasRenderingContext2D,
+    opts: { smooth?: boolean } = {},
+  ): void {
+    // The scale is fixed, so report it rather than leaving whatever the last
+    // draw() happened to measure.
+    this.lastMin = 0;
+    this.lastMax = 1;
+
+    const d = this.img.data;
+    for (let j = 0; j < this.ny; j++) {
+      const row = this.ny - 1 - j;
+      for (let i = 0; i < this.nx; i++) {
+        const k = i + j * this.nx;
+        const o = (i + row * this.nx) * 4;
+        d[o] = r[k] * 255;
+        d[o + 1] = g[k] * 255;
+        d[o + 2] = b[k] * 255;
+      }
+    }
+
+    this.blit(dest, opts.smooth);
+  }
+
+  /** Push the grid-resolution buffer to the display canvas, scaled up. */
+  private blit(dest: CanvasRenderingContext2D, smooth?: boolean): void {
     this.bufCtx.putImageData(this.img, 0, 0);
-    dest.imageSmoothingEnabled = opts.smooth ?? false;
+    dest.imageSmoothingEnabled = smooth ?? false;
     dest.drawImage(this.buf, 0, 0, dest.canvas.width, dest.canvas.height);
   }
 }

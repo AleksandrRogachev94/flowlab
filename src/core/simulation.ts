@@ -1,4 +1,4 @@
-import { advectVelocity } from './advect.ts';
+import { advectScalar, advectVelocity } from './advect.ts';
 import { computeDivergence } from './divergence.ts';
 import { createFields, createGrid, type FieldArray, type Fields, type Grid } from './grid.ts';
 import { solvePressure } from './pressure.ts';
@@ -6,6 +6,14 @@ import { subtractGradient } from './subtractGradient.ts';
 
 /** Writes an initial velocity field. Matches the scene helpers' signature. */
 export type Seed = (g: Grid, u: FieldArray, v: FieldArray) => void;
+
+/**
+ * Writes an initial dye field. Deliberately separate from Seed rather than one
+ * combined `(g, f) => void`: dye is passive, so any tracer pattern is valid
+ * with any velocity scene, and keeping the two apart lets them be mixed freely
+ * — and lets the numerics tests seed velocity with no dye at all.
+ */
+export type DyeSeed = (g: Grid, dye: FieldArray[]) => void;
 
 export interface SimulationParams {
   /**
@@ -43,7 +51,7 @@ export const defaultParams: SimulationParams = {
   cflTarget: 2.0, // initially it was 1. Bridson's book mentions 5.
   dtMax: 1 / 30,
   pressureIters: 500,
-  tol: 5e-3, // initially it was 1e-3
+  tol: 5e-3, // initially it was 1e-3. TODO tune!!!
   omega: 0, // replaced by optimalOmega(n) in the constructor
   rho: 1.0,
 };
@@ -69,6 +77,7 @@ export class Simulation {
   // allocated once and ping-ponged by reference swap, never copied.
   private uNext: FieldArray;
   private vNext: FieldArray;
+  private dyeNext: FieldArray[];
 
   constructor(n: number, params: Partial<SimulationParams> = {}) {
     this.params = { ...defaultParams, omega: optimalOmega(n), ...params };
@@ -77,15 +86,19 @@ export class Simulation {
     this.div = new Float64Array(this.f.p.length);
     this.uNext = new Float64Array(this.f.u.length);
     this.vNext = new Float64Array(this.f.v.length);
+    this.dyeNext = this.f.dye.map(() => new Float64Array(this.f.p.length));
   }
 
   /** Back to t = 0. Clears p too, or the warm start begins from a field
-   *  solving a different problem. */
-  reset(seed: Seed): void {
+   *  solving a different problem. Dye seeding is optional — a headless
+   *  numerics run has no use for a tracer. */
+  reset(seed: Seed, dyeSeed?: DyeSeed): void {
     this.f.u.fill(0);
     this.f.v.fill(0);
     this.f.p.fill(0);
+    for (const c of this.f.dye) c.fill(0);
     seed(this.g, this.f.u, this.f.v);
+    dyeSeed?.(this.g, this.f.dye);
     this.time = 0;
     this.dt = 0;
   }
@@ -116,6 +129,18 @@ export class Simulation {
     this.iters = solvePressure(g, f.p, this.div, f.label, scale, p.pressureIters, p.omega, p.tol);
     subtractGradient(g, f.p, f.u, f.v, f.label, gradScale);
     computeDivergence(g, f.u, f.v, this.div); // now the residual
+
+    // Dye rides the PROJECTED velocity, which is why this sits after the solve
+    // instead of alongside advectVelocity: a divergence-free carrier cannot
+    // artificially concentrate or thin the tracer. Passive, so nothing here
+    // feeds back into u/v and the step is otherwise unaffected by it.
+    //
+    // Channels are fully independent — same velocity, no coupling — so this is
+    // a plain loop rather than anything vector-valued.
+    for (let c = 0; c < f.dye.length; c++) {
+      advectScalar(g, f.u, f.v, f.dye[c], this.dyeNext[c], f.label, dt);
+      [f.dye[c], this.dyeNext[c]] = [this.dyeNext[c], f.dye[c]];
+    }
 
     this.dt = dt;
     this.time += dt;

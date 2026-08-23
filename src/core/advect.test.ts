@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createGrid, createFields, idxU, idxV, type FieldArray } from './grid.ts';
-import { advectVelocity } from './advect.ts';
+import { createGrid, createFields, idxP, idxU, idxV, type FieldArray } from './grid.ts';
+import { advectScalar, advectVelocity } from './advect.ts';
 import { computeDivergence } from './divergence.ts';
 import { solvePressure } from './pressure.ts';
 import { subtractGradient } from './subtractGradient.ts';
@@ -250,4 +250,174 @@ test('a vortex dipole self-propels across the box', () => {
     endY - startY > 0.04,
     `dipole rose only ${(endY - startY).toFixed(4)} (from ${startY.toFixed(4)} to ${endY.toFixed(4)}); expected clear upward travel`,
   );
+});
+
+/**
+ * A constant velocity makes the backtrace exact, so with dt chosen to move the
+ * fluid a WHOLE cell the answer is a pure index shift with no interpolation at
+ * all. That turns advectScalar into an equality test rather than a tolerance
+ * test, and it is the check that pins the half-cell offset: sampling a cell
+ * center half a cell off replaces the shift with a 50/50 blur of two columns.
+ */
+test('advectScalar translates a stripe by exactly one cell', () => {
+  const g = createGrid(8, 8, H);
+  const f = createFields(g, Float64Array);
+  const U = 0.75;
+  f.u.fill(U);
+  f.v.fill(0); // no y motion, so the stripe must stay a stripe
+  for (let j = 0; j < g.ny; j++) f.dye[0][idxP(g, 3, j)] = 1;
+  const out = new Float64Array(g.nx * g.ny).fill(NaN);
+
+  advectScalar(g, f.u, f.v, f.dye[0], out, f.label, H / U);
+
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) {
+      const want = i === 4 ? 1 : 0;
+      assert.ok(
+        Math.abs(out[idxP(g, i, j)] - want) < 1e-12,
+        `cell (${i},${j}) = ${out[idxP(g, i, j)]}, want ${want}`,
+      );
+    }
+  }
+});
+
+test('advectScalar carries dye along +y when only v is set', () => {
+  const g = createGrid(8, 8, H);
+  const f = createFields(g, Float64Array);
+  const V = 0.5;
+  f.v.fill(V);
+  for (let i = 0; i < g.nx; i++) f.dye[0][idxP(g, i, 3)] = 1;
+  const out = new Float64Array(g.nx * g.ny).fill(NaN);
+
+  advectScalar(g, f.u, f.v, f.dye[0], out, f.label, H / V);
+
+  // The mirror of the test above, exercising the y half of the backtrace.
+  // Neither of these can see a bug in the MIDPOINT stage, though: under a
+  // constant velocity the midpoint sample equals the endpoint sample, so RK2
+  // and forward Euler agree. The ramp tests below are what cover that.
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) {
+      const want = j === 4 ? 1 : 0;
+      assert.ok(
+        Math.abs(out[idxP(g, i, j)] - want) < 1e-12,
+        `cell (${i},${j}) = ${out[idxP(g, i, j)]}, want ${want}`,
+      );
+    }
+  }
+});
+
+test('advectScalar invents no new extrema, even at an absurd dt', () => {
+  const g = createGrid(16, 16, H);
+  const f = createFields(g, Float64Array);
+  addVortexPair(g, f.u, f.v);
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) f.dye[0][idxP(g, i, j)] = i < 8 ? 1 : 0;
+  }
+  const out = new Float64Array(g.nx * g.ny).fill(NaN);
+
+  // Bilinear blending bounds the output by the input range, which is what
+  // makes dye safe to render on a FIXED [0,1] ramp: it can fade but never
+  // clip. A scheme that overshoots here (MacCormack unclamped, say) would
+  // need that guarantee restored by explicit clamping.
+  advectScalar(g, f.u, f.v, f.dye[0], out, f.label, 50 * H);
+
+  for (let k = 0; k < out.length; k++) {
+    assert.ok(Number.isFinite(out[k]), `cell ${k} never written`);
+    assert.ok(out[k] >= -1e-12 && out[k] <= 1 + 1e-12, `cell ${k} = ${out[k]} escaped [0,1]`);
+  }
+});
+
+test('advectScalar leaves a uniform dye field untouched', () => {
+  const g = createGrid(16, 16, H);
+  const f = createFields(g, Float64Array);
+  addVortexPair(g, f.u, f.v);
+  f.dye[0].fill(0.7);
+  const out = new Float64Array(g.nx * g.ny).fill(NaN);
+
+  advectScalar(g, f.u, f.v, f.dye[0], out, f.label, 0.3 * H);
+
+  // Any backtrace whatsoever lands in a region of constant 0.7, so this is
+  // independent of the velocity being right — it isolates the sampler's edge
+  // clamping. An out-of-range read shows up as NaN, not as a small error.
+  for (let k = 0; k < out.length; k++) {
+    assert.ok(Math.abs(out[k] - 0.7) < 1e-12, `cell ${k} = ${out[k]}`);
+  }
+});
+
+/**
+ * The scalar counterpart of the RK2 ramp tests above, and the only kind that
+ * can see a bug in the midpoint stage: under a CONSTANT velocity the midpoint
+ * sample equals the endpoint sample, so every exact-translation test passes
+ * whichever velocity component the midpoint reads.
+ *
+ * Both the dye and the velocity are linear, so bilinear interpolation is exact
+ * and the whole backtrace has a closed form. With u(x) = x/h, v = 0 and dye
+ * q(x) = x/h, backtracing from the center of column i (x = (i+0.5)h) gives
+ *   mid  = x(1 - r/2)
+ *   prev = x(1 - r + r^2/2),   r = dt/h
+ * and since q just reports the x it was sampled at, the answer is that same
+ * factor times (i+0.5). Forward Euler would give (i+0.5)(1 - r) instead.
+ */
+test('advectScalar RK2 on a velocity ramp matches the closed form', () => {
+  const g = createGrid(8, 4, H);
+  const f = createFields(g, Float64Array);
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i <= g.nx; i++) f.u[idxU(g, i, j)] = i; // u(x) = x/h
+  }
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) f.dye[0][idxP(g, i, j)] = i + 0.5; // q(x) = x/h
+  }
+  const dt = 0.5 * H;
+  const r = dt / g.h;
+  const factor = 1 - r + 0.5 * r * r;
+  const out = new Float64Array(g.nx * g.ny).fill(NaN);
+
+  advectScalar(g, f.u, f.v, f.dye[0], out, f.label, dt);
+
+  // From i = 1: column 0 backtraces past the first cell center, where sampleP
+  // clamps and the closed form stops applying.
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 1; i < g.nx; i++) {
+      const got = out[idxP(g, i, j)];
+      const want = (i + 0.5) * factor;
+      assert.ok(Math.abs(got - want) < 1e-12, `cell (${i},${j}) = ${got}, expected ${want}`);
+      assert.ok(
+        Math.abs(got - (i + 0.5) * (1 - r)) > 1e-9,
+        `cell (${i},${j}) looks like forward Euler`,
+      );
+    }
+  }
+});
+
+test('advectScalar RK2 holds on a ramp in y too', () => {
+  const g = createGrid(4, 8, H);
+  const f = createFields(g, Float64Array);
+  for (let j = 0; j <= g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) f.v[idxV(g, i, j)] = j; // v(y) = y/h
+  }
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) f.dye[0][idxP(g, i, j)] = j + 0.5; // q(y) = y/h
+  }
+  const dt = 0.5 * H;
+  const r = dt / g.h;
+  const factor = 1 - r + 0.5 * r * r;
+  const out = new Float64Array(g.nx * g.ny).fill(NaN);
+
+  advectScalar(g, f.u, f.v, f.dye[0], out, f.label, dt);
+
+  // Run as a pair, these two pin each midpoint stage to its OWN velocity
+  // component: reading v for midX passes the x test (where v is 0, so the
+  // midpoint collapses back to Euler and the r^2/2 term vanishes) and fails
+  // here, and the reverse for reading u in midY.
+  for (let j = 1; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) {
+      const got = out[idxP(g, i, j)];
+      const want = (j + 0.5) * factor;
+      assert.ok(Math.abs(got - want) < 1e-12, `cell (${i},${j}) = ${got}, expected ${want}`);
+      assert.ok(
+        Math.abs(got - (j + 0.5) * (1 - r)) > 1e-9,
+        `cell (${i},${j}) looks like forward Euler`,
+      );
+    }
+  }
 });
