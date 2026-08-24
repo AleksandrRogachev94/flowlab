@@ -6,6 +6,17 @@ export type Normalization =
   | { kind: 'auto' }
   /** map [-m,m] onto [0,1] where m = max|value|, so 0 lands exactly at 0.5 */
   | { kind: 'symmetric' }
+  /**
+   * Like 'symmetric', but m is the p-th percentile of |value| rather than the
+   * max, and anything past it clamps to the end of the ramp.
+   *
+   * For a field whose extremes live in a few cells, the max is a terrible
+   * scale: on the karman wake, max|curl| sits on the cylinder's staircase
+   * corners at ~8x the shed vortices, which would render the whole street in
+   * the middle eighth of the ramp. The percentile scales to the wake and
+   * clamps only the surface spike — a discretization artifact, not the subject.
+   */
+  | { kind: 'percentile'; p: number }
   /** fixed range, so colors are comparable across frames */
   | { kind: 'fixed'; min: number; max: number };
 
@@ -51,6 +62,34 @@ export function computeRange(
         if (a > m) m = a;
       }
       return { lo: -m, hi: m };
+    }
+    case 'percentile': {
+      // Histogram rather than a sort: one extra O(n) pass instead of
+      // O(n log n) plus an allocation, and BINS resolution on the threshold is
+      // far finer than the colour ramp can show anyway.
+      let max = 0;
+      for (let i = 0; i < field.length; i++) {
+        const a = Math.abs(field[i]);
+        if (a > max) max = a;
+      }
+      if (max === 0) return { lo: 0, hi: 0 };
+
+      const BINS = 512;
+      const counts = new Int32Array(BINS);
+      for (let i = 0; i < field.length; i++) {
+        const b = Math.min(BINS - 1, Math.floor((Math.abs(field[i]) / max) * BINS));
+        counts[b] += 1;
+      }
+
+      const target = normalization.p * field.length;
+      let seen = 0;
+      for (let b = 0; b < BINS; b++) {
+        seen += counts[b];
+        // Upper edge of the bin the percentile falls in, so m is never 0 when
+        // the percentile lands in the first bin.
+        if (seen >= target) return { lo: (-(b + 1) / BINS) * max, hi: ((b + 1) / BINS) * max };
+      }
+      return { lo: -max, hi: max };
     }
     case 'fixed':
       return { lo: normalization.min, hi: normalization.max };

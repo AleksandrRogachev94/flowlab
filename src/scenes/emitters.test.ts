@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createFields, createGrid, idxP, idxU } from '../core/grid.ts';
+import { Cell, createFields, createGrid, idxP, idxU } from '../core/grid.ts';
 import { computeDivergence } from '../core/divergence.ts';
-import { Simulation } from '../core/simulation.ts';
+import { Simulation, type LabelSeed } from '../core/simulation.ts';
 import { defaultWallJet, wallJet } from './emitters.ts';
+import { openRight } from './obstacles.ts';
 
 const N = 32;
 const setup = () => {
@@ -47,40 +48,96 @@ test('inflow flux is the same scene at every resolution', () => {
   );
 });
 
-test('inflow and outflow balance, so the pressure system stays compatible', () => {
+test('the jet is pure inflow, so the books do NOT balance on their own', () => {
+  // Guards the contract change: wallJet used to push the same flux back out
+  // across the far wall, which balanced the budget but PRESCRIBED the exit
+  // profile and made the boundary reflect. Settling the budget is now the
+  // scene's job, and this asserts the emitter really has stopped doing it.
   const { g, f, div } = setup();
   wallJet().seed(g, f.u, f.v);
   computeDivergence(g, f.u, f.v, div);
 
+  // By the divergence theorem, sum(div) * h^2 is the net OUTWARD flux, and the
+  // interior faces telescope away — so it must come out as exactly minus the
+  // inlet flux. Negative, because mass is entering. Machine precision, not
+  // O(h): this is a discrete identity, not an approximation.
   let sum = 0;
   for (const d of div) sum += d;
-  // Machine precision, not O(h): an inconsistent RHS makes SOR burn every
-  // sweep and drift p by a growing constant.
-  assert.ok(Math.abs(sum) < 1e-9, `total divergence = ${sum}, expected ~0`);
+
+  let inlet = 0;
+  for (let j = 0; j < g.ny; j++) inlet += f.u[idxU(g, 0, j)] * g.h;
+
+  assert.ok(inlet > 0.1, `inlet flux ${inlet} — the jet is not actually flowing`);
+  assert.ok(
+    Math.abs(sum * g.h * g.h + inlet) < 1e-12,
+    `net outward flux ${sum * g.h * g.h}, expected ${-inlet} — the emitter is ` +
+      `balancing its own books again, which prescribes the exit profile`,
+  );
+});
+
+test('a net inflow needs an open outlet, and one Air column provides it', () => {
+  // A closed box is all-Neumann, so a net inflow makes the system INCONSISTENT:
+  // no p satisfies it, SOR burns every sweep against a residual floor it can
+  // never cross, and the null-space component drives p away without bound.
+  // One Air column pins p = 0 and the same problem becomes solvable.
+  const CAP = 120;
+  const run = (labels?: LabelSeed) => {
+    const sim = new Simulation(N, N, { pressureIters: CAP });
+    sim.reset({ labels, seed: wallJet().seed });
+    for (let n = 0; n < 60; n++) sim.step();
+
+    let pMax = 0;
+    for (const x of sim.f.p) pMax = Math.max(pMax, Math.abs(x));
+    let sumSq = 0;
+    let count = 0;
+    for (let k = 0; k < sim.div.length; k++) {
+      if (sim.f.label[k] !== Cell.Fluid) continue;
+      sumSq += sim.div[k] * sim.div[k];
+      count += 1;
+    }
+    return { iters: sim.iters, pMax, divRms: Math.sqrt(sumSq / count) };
+  };
+
+  const closed = run();
+  const open = run(openRight());
+
+  assert.equal(closed.iters, CAP, 'a closed box should never meet tolerance here');
+  assert.ok(open.iters < CAP, `open outlet still pinned at the cap (${open.iters})`);
+  // Measured at N=32: 430x on the residual, 280x on the drift. 100x is slack.
+  assert.ok(
+    open.divRms * 100 < closed.divRms,
+    `residual ${open.divRms} open vs ${closed.divRms} closed`,
+  );
+  assert.ok(open.pMax * 100 < closed.pMax, `p drifted to ${open.pMax} despite an outlet`);
 });
 
 test('prescribed wall faces survive advection and projection unchanged', () => {
-  const sim = new Simulation(N, { pressureIters: 200 });
+  const sim = new Simulation(N, N, { pressureIters: 200 });
   const jet = wallJet();
-  sim.reset(jet.seed, undefined, jet.source);
+  sim.reset({ labels: openRight(), seed: jet.seed, dyeSource: jet.source });
   const wall = sim.f.u.slice();
 
   for (let n = 0; n < 60; n++) sim.step();
 
   for (let j = 0; j < sim.g.ny; j++) {
-    for (const i of [0, sim.g.nx]) {
-      const k = idxU(sim.g, i, j);
-      assert.equal(sim.f.u[k], wall[k], `wall face u[${i},${j}] was clobbered`);
-    }
+    // The INLET only. u[nx,j] is no longer prescribed: it fronts an Air cell,
+    // so applyOutflow extrapolates it every step — that is the open boundary.
+    const k = idxU(sim.g, 0, j);
+    assert.equal(sim.f.u[k], wall[k], `inlet face u[0,${j}] was clobbered`);
+    assert.equal(
+      sim.f.u[idxU(sim.g, sim.g.nx, j)],
+      sim.f.u[idxU(sim.g, sim.g.nx - 1, j)],
+      `outlet face u[nx,${j}] is not a zero-gradient copy of its neighbour`,
+    );
   }
   assert.ok(sim.f.u.every(Number.isFinite), 'u went non-finite');
   assert.ok(sim.iters < 200, `solve pinned at the cap (${sim.iters}) — RHS likely inconsistent`);
 });
 
 test('the dye source holds its band and carries downstream', () => {
-  const sim = new Simulation(N, { pressureIters: 200 });
+  const sim = new Simulation(N, N, { pressureIters: 200 });
   const jet = wallJet({ depthCells: 2 });
-  sim.reset(jet.seed, undefined, jet.source);
+  sim.reset({ labels: openRight(), seed: jet.seed, dyeSource: jet.source });
 
   const mid = Math.floor(N / 2);
   const [r, g, b] = sim.f.dye;
@@ -105,10 +162,12 @@ test('uniform through-flow is an exact steady solution', () => {
   // advect + project must return it bit-for-bit. Catches sign errors, the
   // wall-face bounds in subtractGradient, and half-cell offsets in sampling.
   const U = 0.5;
-  const sim = new Simulation(N, { pressureIters: 200 });
-  sim.reset((g, u, v) => {
-    u.fill(U);
-    v.fill(0);
+  const sim = new Simulation(N, N, { pressureIters: 200 });
+  sim.reset({
+    seed: (g, u, v) => {
+      u.fill(U);
+      v.fill(0);
+    },
   });
 
   for (let n = 0; n < 20; n++) sim.step();

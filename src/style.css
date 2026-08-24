@@ -1,56 +1,89 @@
 :root {
   color-scheme: dark;
+  --bg: #0e1013;
+  --panel: #171a20;
+  --line: #272c35;
+  --text: #d8dde5;
+  --dim: #7d8797;
+}
+* {
+  box-sizing: border-box;
 }
 body {
   margin: 0;
   font:
-    14px/1.5 ui-monospace,
+    13px/1.5 ui-monospace,
     SFMono-Regular,
     Menlo,
     monospace;
-  background: #14161a;
-  color: #d8dde5;
+  background: var(--bg);
+  color: var(--text);
 }
+
+/* Full viewport, three rows: header / stage / readout. The stage takes all
+   remaining height, and main.ts fits the canvas inside whatever that is —
+   so there is no hard-coded chrome height to drift out of date. */
 main {
-  padding: 24px;
+  height: 100vh;
+  overflow: hidden;
+  padding: 14px 18px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  align-items: start;
+  gap: 10px;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
 }
 h1 {
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 600;
   margin: 0;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+#stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
 }
 canvas {
-  border: 1px solid #2c3138;
-  /* the canvas backing store is 512x512; CSS keeps it that size so one
-     backing-store pixel == one CSS pixel. Grid->screen scaling is done by
-     drawImage inside the renderer, not by CSS. */
-  image-rendering: pixelated;
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #000;
 }
+
 .controls {
   display: flex;
-  gap: 8px;
+  gap: 6px;
 }
 button {
   font: inherit;
-  color: #d8dde5;
-  background: #1e222a;
-  border: 1px solid #2c3138;
-  border-radius: 4px;
-  padding: 4px 10px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 5px 11px;
   cursor: pointer;
 }
 button:hover {
-  background: #262b34;
+  background: #202530;
   border-color: #3a4250;
 }
+/* Fixed two lines, and never allowed to shrink — the stage above it is what
+   gives way when the window is short, not the numbers. */
 #readout {
   margin: 0;
-  color: #8b94a3;
-  min-height: 3em;
+  flex: none;
+  height: 2.8em;
+  color: var(--dim);
   white-space: pre;
+  overflow: hidden;
 }

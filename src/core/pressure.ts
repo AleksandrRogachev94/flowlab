@@ -1,4 +1,4 @@
-import { idxP, isSolid, type FieldArray, type Grid } from './grid.ts';
+import { Cell, idxP, isSolidOrOutside, type FieldArray, type Grid } from './grid.ts';
 
 /**
  * One Gauss-Seidel / SOR sweep of the pressure Poisson equation.
@@ -10,22 +10,24 @@ import { idxP, isSolid, type FieldArray, type Grid } from './grid.ts';
  * In-place on `p` by design: reading partially-updated neighbours is exactly
  * what makes GS converge 2x faster than Jacobi (ARCHITECTURE.md Rule 2).
  *
- * TODO(you):
- *   for each cell (i,j):
- *     skip if the cell itself is solid
- *     count = 0, sum = 0
- *     for each of the 4 neighbours:
- *       solid (or outside domain) -> contributes nothing, not counted
- *       air                       -> counted, but p = 0 so adds nothing
- *       fluid                     -> counted, and add its p to sum
- *     if count === 0 continue            // fully enclosed, nothing to solve
- *     pGS = (sum - scale * div[i,j]) / count
- *     p[i,j] = (1 - omega) * p[i,j] + omega * pGS
+ * Only FLUID cells get an equation. Solid cells have no pressure at all, and
+ * Air cells ARE the Dirichlet condition p = 0 — skipping them is what pins
+ * their value, since nothing else ever writes p there.
+ *
+ * The neighbour loop needs no Air branch, and that is not an oversight: an Air
+ * neighbour is non-solid, so it is counted in `count`, and its stored p is 0,
+ * so it adds nothing to `sum`. That is exactly Bridson's row (diagonal = number
+ * of non-solid neighbours, off-diagonal -1 for FLUID neighbours only). The
+ * invariant it rests on — p is 0 in every Air cell — is established by
+ * commitLabels() in boundaries.ts and never disturbed afterwards.
  *
  * @param p     cell-centred pressure. Read AND written in the same pass.
  * @param div   divergence of the tentative velocity u*, cell-centred.
  * @param label per-cell Fluid/Air/Solid. Solid neighbours impose dp/dn = 0
- *              (Neumann); Air neighbours impose p = 0 (Dirichlet).
+ *              (Neumann); Air neighbours impose p = 0 (Dirichlet). At least
+ *              one Air cell makes the system nonsingular — an all-Neumann box
+ *              is solvable only when total boundary flux is exactly zero, and
+ *              its p drifts by an arbitrary constant.
  * @param scale rho * h^2 / dt. Converts a divergence into a pressure — it is
  *              what makes the RHS of the linear system dimensionally a
  *              pressure rather than a rate of volume change.
@@ -34,8 +36,6 @@ import { idxP, isSolid, type FieldArray, type Grid } from './grid.ts';
  *              faster; >= 2 diverges unconditionally. Optimal for an n x n
  *              box is 2 / (1 + sin(PI / n)) ~ 1.907 at n = 64, worth roughly
  *              40x fewer sweeps than omega = 1.
- *
- * (Air never occurs in Step 1's closed box; it arrives with free surfaces.)
  */
 export function gaussSeidelSweep(
   g: Grid,
@@ -56,25 +56,27 @@ export function gaussSeidelSweep(
 
   for (let j = jFrom; j !== jTo; j += jStep) {
     for (let i = iFrom; i !== iTo; i += iStep) {
-      if (isSolid(g, label, i, j)) {
+      // Not isSolidOrOutside(): (i,j) is in-domain by construction here, and this must
+      // skip Air as well as Solid.
+      if (label[idxP(g, i, j)] !== Cell.Fluid) {
         continue;
       }
       let count = 0;
       let sum = 0;
 
-      if (!isSolid(g, label, i + 1, j)) {
+      if (!isSolidOrOutside(g, label, i + 1, j)) {
         count += 1;
         sum += p[idxP(g, i + 1, j)];
       }
-      if (!isSolid(g, label, i, j + 1)) {
+      if (!isSolidOrOutside(g, label, i, j + 1)) {
         count += 1;
         sum += p[idxP(g, i, j + 1)];
       }
-      if (!isSolid(g, label, i - 1, j)) {
+      if (!isSolidOrOutside(g, label, i - 1, j)) {
         count += 1;
         sum += p[idxP(g, i - 1, j)];
       }
-      if (!isSolid(g, label, i, j - 1)) {
+      if (!isSolidOrOutside(g, label, i, j - 1)) {
         count += 1;
         sum += p[idxP(g, i, j - 1)];
       }
@@ -109,22 +111,22 @@ export function rmsRemainingDivergence(
 
   for (let j = 0; j < g.ny; j += 1) {
     for (let i = 0; i < g.nx; i += 1) {
-      if (isSolid(g, label, i, j)) continue;
+      if (label[idxP(g, i, j)] !== Cell.Fluid) continue;
       let count = 0;
       let sum = 0;
-      if (!isSolid(g, label, i + 1, j)) {
+      if (!isSolidOrOutside(g, label, i + 1, j)) {
         count += 1;
         sum += p[idxP(g, i + 1, j)];
       }
-      if (!isSolid(g, label, i, j + 1)) {
+      if (!isSolidOrOutside(g, label, i, j + 1)) {
         count += 1;
         sum += p[idxP(g, i, j + 1)];
       }
-      if (!isSolid(g, label, i - 1, j)) {
+      if (!isSolidOrOutside(g, label, i - 1, j)) {
         count += 1;
         sum += p[idxP(g, i - 1, j)];
       }
-      if (!isSolid(g, label, i, j - 1)) {
+      if (!isSolidOrOutside(g, label, i, j - 1)) {
         count += 1;
         sum += p[idxP(g, i, j - 1)];
       }
@@ -168,10 +170,24 @@ export function solvePressure(
   omega = 1.0,
   tol = 1e-3,
 ): number {
+  // FLUID cells only: divergence inside a solid is stale face data, and an Air
+  // outlet is SUPPOSED to be divergent — either would inflate this denominator
+  // and silently loosen a tolerance stated relative to the real divergence.
   let sumSq = 0;
-  for (const d of div) sumSq += d * d;
-  const divRms = Math.sqrt(sumSq / div.length);
-  if (divRms === 0) return 0; // already divergence-free; any p works
+  let nFluid = 0;
+  for (let k = 0; k < div.length; k++) {
+    if (label[k] !== Cell.Fluid) continue;
+    sumSq += div[k] * div[k];
+    nFluid += 1;
+  }
+  const divRms = nFluid > 0 ? Math.sqrt(sumSq / nFluid) : 0;
+  if (divRms === 0) {
+    // Already divergence-free, and p = 0 is the exact solution. NOT "any p":
+    // subtractGradient applies p unconditionally, so returning a warm-started
+    // leftover here would re-inject divergence into a clean field.
+    p.fill(0);
+    return 0;
+  }
 
   // tol <= 0 means "always run the full cap", so skip the checks entirely —
   // they cost about a sweep each and could never pass.

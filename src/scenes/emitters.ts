@@ -7,13 +7,17 @@
  * Bridson's u_solid correction, already folded in). Write it once at reset
  * and it holds for the whole run.
  *
- * The catch is the flux budget. The box is closed and all-Neumann, so the
- * pressure system is solvable only if total boundary flux is zero; net inflow
- * makes it inconsistent, and SOR then burns every sweep without crossing its
- * residual floor while p drifts by a growing constant. So the same flux is
- * pushed back out across the opposite wall. A real open boundary (Air cells
- * pinned at p = 0) would let the flow choose its own exit profile instead,
- * but pressure.ts skips only Solid today — that is the next step, not this one.
+ * The catch is the flux budget, and it is the SCENE's to settle, not this
+ * file's. An all-Neumann box is solvable only if total boundary flux is zero;
+ * net inflow makes the system inconsistent, and SOR then burns every sweep
+ * without crossing its residual floor while p drifts by a growing constant.
+ *
+ * This emitter is therefore pure inflow, and every scene using it must pair it
+ * with an outlet — `openRight()` from obstacles.ts, an Air column pinned at
+ * p = 0. An earlier version balanced the books itself by pushing the same flux
+ * back out across the opposite wall; that kept the solve consistent but
+ * PRESCRIBED the exit profile, which makes the boundary reflect anything that
+ * reaches it. An open boundary lets the flow choose its own way out.
  */
 
 import { idxP, idxU, type Grid } from '../core/grid.ts';
@@ -74,15 +78,7 @@ export function wallJet(options: Partial<WallJetOptions> = {}): {
   // ADDs, like the seeds in testFields.ts, so a jet composes with a scene.
   // v is untouched: v[0,j] is an interior face the projection owns.
   const seed: Seed = (g, u) => {
-    let flux = 0;
-    for (let j = 0; j < g.ny; j++) {
-      const inflow = speed * weight(g, j);
-      u[idxU(g, 0, j)] += inflow;
-      flux += inflow;
-    }
-    // Accumulated, never recomputed as speed*(y1-y0)/h: the balance must hold
-    // to machine precision, and an analytic total misses by the edge error.
-    for (let j = 0; j < g.ny; j++) u[idxU(g, g.nx, j)] += flux / g.ny;
+    for (let j = 0; j < g.ny; j++) u[idxU(g, 0, j)] += speed * weight(g, j);
   };
 
   // Plain assignment, and no taper on the dye: weighting it toward `colour`

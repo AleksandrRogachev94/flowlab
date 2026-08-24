@@ -1,0 +1,89 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { applyOutflow, commitLabels } from './boundaries.ts';
+import { Cell, createFields, createGrid, idxP, idxU, idxV } from './grid.ts';
+
+const g = createGrid(6, 6, 1 / 6);
+
+test('commitLabels zeroes every face touching a solid', () => {
+  const f = createFields(g, Float64Array);
+  f.u.fill(1);
+  f.v.fill(1);
+  f.label[idxP(g, 2, 2)] = Cell.Solid;
+
+  commitLabels(g, f);
+
+  // All four faces of the solid cell, by the per-cell reading of the layout.
+  assert.equal(f.u[idxU(g, 2, 2)], 0, 'left face');
+  assert.equal(f.u[idxU(g, 3, 2)], 0, 'right face');
+  assert.equal(f.v[idxV(g, 2, 2)], 0, 'bottom face');
+  assert.equal(f.v[idxV(g, 2, 3)], 0, 'top face');
+  // One cell further out is fluid-fluid and must survive.
+  assert.equal(f.u[idxU(g, 1, 2)], 1, 'a fluid-fluid face was cleared');
+});
+
+test('commitLabels leaves PRESCRIBED domain-boundary faces alone', () => {
+  // The regression this exists for: grid.ts's isSolidOrOutside() reports true outside
+  // the domain, so reusing it here would zero the outer faces — silently
+  // deleting a jet inlet or a free-stream velocity every time labels changed.
+  const f = createFields(g, Float64Array);
+  f.u.fill(2);
+  f.label[idxP(g, 3, 3)] = Cell.Solid;
+
+  commitLabels(g, f);
+
+  for (let j = 0; j < g.ny; j++) {
+    assert.equal(f.u[idxU(g, 0, j)], 2, `inlet face u[0,${j}] was cleared`);
+    assert.equal(f.u[idxU(g, g.nx, j)], 2, `outlet face u[nx,${j}] was cleared`);
+  }
+});
+
+test('commitLabels pins p = 0 in Air and clears dye from Solid', () => {
+  const f = createFields(g, Float64Array);
+  f.p.fill(5);
+  for (const c of f.dye) c.fill(1);
+  const air = idxP(g, 5, 1);
+  const solid = idxP(g, 2, 2);
+  f.label[air] = Cell.Air;
+  f.label[solid] = Cell.Solid;
+
+  commitLabels(g, f);
+
+  assert.equal(f.p[air], 0, 'Air is the Dirichlet value the sweep reads');
+  // Dye stamped before the obstacle existed would otherwise sit frozen inside
+  // it forever AND be picked up by neighbouring cells' backtraces.
+  for (const c of f.dye) assert.equal(c[solid], 0);
+  // Fluid cells are untouched.
+  assert.equal(f.p[idxP(g, 1, 1)], 5);
+  assert.equal(f.dye[0][idxP(g, 1, 1)], 1);
+});
+
+test('applyOutflow extrapolates onto an Air cell boundary face, and only there', () => {
+  const f = createFields(g, Float64Array);
+  for (let j = 0; j < g.ny; j++) f.u[idxU(g, g.nx - 1, j)] = j + 1;
+  // Air on the right edge for the lower half only, so the same call has to
+  // both act and not act within one loop.
+  for (let j = 0; j < 3; j++) f.label[idxP(g, g.nx - 1, j)] = Cell.Air;
+
+  applyOutflow(g, f.u, f.v, f.label);
+
+  for (let j = 0; j < 3; j++) {
+    assert.equal(f.u[idxU(g, g.nx, j)], j + 1, `row ${j} should be extrapolated`);
+  }
+  for (let j = 3; j < g.ny; j++) {
+    assert.equal(f.u[idxU(g, g.nx, j)], 0, `row ${j} is a wall and must stay put`);
+  }
+});
+
+test('applyOutflow is a no-op on a closed box', () => {
+  const f = createFields(g, Float64Array);
+  f.u.fill(3);
+  f.v.fill(4);
+  const u0 = f.u.slice();
+  const v0 = f.v.slice();
+
+  applyOutflow(g, f.u, f.v, f.label);
+
+  assert.deepEqual([...f.u], [...u0]);
+  assert.deepEqual([...f.v], [...v0]);
+});

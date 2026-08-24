@@ -1,6 +1,7 @@
 import { advectScalar, advectVelocity } from './advect.ts';
+import { applyOutflow, commitLabels } from './boundaries.ts';
 import { computeDivergence } from './divergence.ts';
-import { createFields, createGrid, type FieldArray, type Fields, type Grid } from './grid.ts';
+import { Cell, createFields, createGrid, type FieldArray, type Fields, type Grid } from './grid.ts';
 import { solvePressure } from './pressure.ts';
 import { subtractGradient } from './subtractGradient.ts';
 
@@ -22,6 +23,26 @@ export type DyeSeed = (g: Grid, dye: FieldArray[]) => void;
  * ignores it.
  */
 export type DyeSource = (g: Grid, dye: FieldArray[], dt: number) => void;
+
+/**
+ * Writes the Fluid/Air/Solid layout: obstacles, and open outlets. Runs BEFORE
+ * the velocity seed, so a seed can read nothing from it — labels are geometry,
+ * and commitLabels() afterwards is what reconciles the two.
+ */
+export type LabelSeed = (g: Grid, label: Uint8Array) => void;
+
+/**
+ * Everything a scene supplies. An object rather than positional arguments
+ * because the four parts are independent — any velocity seed composes with any
+ * tracer, and the geometry is orthogonal to both — and because the ORDER they
+ * are applied in is a correctness detail reset() owns, not the caller.
+ */
+export interface SceneSpec {
+  labels?: LabelSeed;
+  seed?: Seed;
+  dye?: DyeSeed;
+  dyeSource?: DyeSource;
+}
 
 export interface SimulationParams {
   /**
@@ -62,17 +83,26 @@ export interface SimulationParams {
   dyeDecay: number;
 }
 
-/** Classical optimal SOR factor for an n x n Poisson problem. */
-export function optimalOmega(n: number): number {
-  return 2 / (1 + Math.sin(Math.PI / n));
+/**
+ * Classical optimal SOR factor for an nx by ny Poisson problem:
+ * omega = 2 / (1 + sqrt(1 - rho^2)), rho = (cos(pi/nx) + cos(pi/ny)) / 2,
+ * where rho is the Jacobi iteration's spectral radius.
+ *
+ * Reduces exactly to the familiar 2 / (1 + sin(pi/n)) when nx === ny, since
+ * sqrt(1 - cos^2) = sin. A channel is far from square, and the aspect ratio
+ * genuinely moves the optimum — using the short side alone under-relaxes badly.
+ */
+export function optimalOmega(nx: number, ny: number = nx): number {
+  const rho = 0.5 * (Math.cos(Math.PI / nx) + Math.cos(Math.PI / ny));
+  return 2 / (1 + Math.sqrt(1 - rho * rho));
 }
 
 export const defaultParams: SimulationParams = {
   cflTarget: 2.0, // initially it was 1. Bridson's book mentions 5.
   dtMax: 1 / 30,
-  pressureIters: 1000,
-  tol: 5e-3, // initially it was 1e-3. TODO tune!!!
-  omega: 0, // replaced by optimalOmega(n) in the constructor
+  pressureIters: 100,
+  tol: 5e-3, // strict headless-reference default; the browser passes looser (see main.ts)
+  omega: 0, // replaced by optimalOmega(nx, ny) in the constructor
   rho: 1.0,
   dyeDecay: 0,
 };
@@ -103,9 +133,17 @@ export class Simulation {
   /** Set by reset(), so switching scenes can't leave an emitter running. */
   private dyeSource: DyeSource | null = null;
 
-  constructor(n: number, params: Partial<SimulationParams> = {}) {
-    this.params = { ...defaultParams, omega: optimalOmega(n), ...params };
-    this.g = createGrid(n, n, 1 / n);
+  /**
+   * `h = 1 / ny`, so the domain is always exactly ONE unit tall and nx/ny
+   * units wide. Square grids are unaffected (h = 1/n as before) and every
+   * existing scene's world coordinates still mean what they did; a channel
+   * just extends to the right. Anchoring the unit to the height rather than
+   * the width is what keeps a cylinder diameter or a jet band the same
+   * physical size when the domain gets longer.
+   */
+  constructor(nx: number, ny: number = nx, params: Partial<SimulationParams> = {}) {
+    this.params = { ...defaultParams, omega: optimalOmega(nx, ny), ...params };
+    this.g = createGrid(nx, ny, 1 / ny);
     this.f = createFields(this.g, Float64Array);
     this.div = new Float64Array(this.f.p.length);
     this.uNext = new Float64Array(this.f.u.length);
@@ -113,19 +151,33 @@ export class Simulation {
     this.dyeNext = this.f.dye.map(() => new Float64Array(this.f.p.length));
   }
 
-  /** Back to t = 0. Clears p too, or the warm start begins from a field
-   *  solving a different problem. Dye seeding is optional — a headless
-   *  numerics run has no use for a tracer. A source is applied once here too
-   *  (dt = 0), since a boundary condition must already hold at t = 0. */
-  reset(seed: Seed, dyeSeed?: DyeSeed, dyeSource?: DyeSource): void {
-    this.f.u.fill(0);
-    this.f.v.fill(0);
-    this.f.p.fill(0);
-    for (const c of this.f.dye) c.fill(0);
-    seed(this.g, this.f.u, this.f.v);
-    dyeSeed?.(this.g, this.f.dye);
-    this.dyeSource = dyeSource ?? null;
-    this.dyeSource?.(this.g, this.f.dye, 0);
+  /**
+   * Back to t = 0. Clears p too (or the warm start begins from a field solving
+   * a different problem) and `label` (or switching scenes could leave an
+   * obstacle behind). Every part is optional.
+   *
+   * The order is the point: commitLabels runs AFTER the seeds, so a velocity
+   * seed may paint the whole field (`u.fill(U)`) without knowing where the
+   * obstacles are — whatever it wrote inside a solid is cleaned up before
+   * computeDivergence, which reads faces without consulting labels, could see
+   * it. The dye source runs last, applied once at dt = 0, since a boundary
+   * condition on the tracer must already hold at t = 0.
+   */
+  reset(scene: SceneSpec = {}): void {
+    const { g, f } = this;
+    f.u.fill(0);
+    f.v.fill(0);
+    f.p.fill(0);
+    f.label.fill(Cell.Fluid);
+    for (const c of f.dye) c.fill(0);
+
+    scene.labels?.(g, f.label);
+    scene.seed?.(g, f.u, f.v);
+    scene.dye?.(g, f.dye);
+    commitLabels(g, f);
+
+    this.dyeSource = scene.dyeSource ?? null;
+    this.dyeSource?.(g, f.dye, 0);
     this.time = 0;
     this.dt = 0;
   }
@@ -155,6 +207,9 @@ export class Simulation {
     computeDivergence(g, f.u, f.v, this.div);
     this.iters = solvePressure(g, f.p, this.div, f.label, scale, p.pressureIters, p.omega, p.tol);
     subtractGradient(g, f.p, f.u, f.v, f.label, gradScale);
+    // Before the residual and before dye rides it: this is part of producing
+    // the final velocity field, not a diagnostic. No-op on a closed box.
+    applyOutflow(g, f.u, f.v, f.label);
     computeDivergence(g, f.u, f.v, this.div); // now the residual
 
     // Dye rides the PROJECTED velocity, which is why this sits after the solve

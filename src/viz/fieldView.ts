@@ -1,4 +1,4 @@
-import { idxP, type Grid } from '../core/grid.ts';
+import { Cell, idxP, type Grid } from '../core/grid.ts';
 import type { Simulation } from '../core/simulation.ts';
 import { computeVorticity } from '../core/vorticity.ts';
 import { coolwarm, iceFire, ocean } from './colormaps.ts';
@@ -49,6 +49,10 @@ export class FieldView {
         const [cu, cv] = cellVelocity(g, f.u, f.v, i, j);
         const s = Math.hypot(cu, cv);
         this.speed[k] = s;
+        // FLUID cells only: an Air outlet is supposed to be divergent and a
+        // solid's faces are frozen boundary data — either would blow out the
+        // stats with values nothing is solving for.
+        if (f.label[k] !== Cell.Fluid) continue;
         if (s > maxSpeed) maxSpeed = s;
         const d = Math.abs(div[k]);
         if (d > divMax) divMax = d;
@@ -60,8 +64,13 @@ export class FieldView {
       // Sign carries the meaning, so a counter-rotating pair must read as
       // opposite colours around zero. iceFire not coolwarm: zero must be DARK
       // or the white arrows vanish over the calm majority of the frame.
+      //
+      // p99 and not the max: the max lives on the cylinder's staircase corners
+      // at ~5x anything in the wake, so scaling to it renders the whole vortex
+      // street nearly black. Solid cells need no masking here — drawSolids
+      // paints over them, and at p99 they do not move the range at all.
       this.heatmap.draw(this.vort, ctx, {
-        normalization: { kind: 'symmetric' },
+        normalization: { kind: 'percentile', p: 0.99 },
         colormap: iceFire,
         smooth: true,
       });
@@ -88,17 +97,57 @@ export class FieldView {
       });
     }
 
+    this.drawSolids(ctx, g, f.label);
+
+    // Device pixels per CSS pixel: the backing store is oversampled on a retina
+    // display, so every pixel length below must scale with it.
+    const dpr = ctx.canvas.width / (ctx.canvas.clientWidth || ctx.canvas.width);
+
     // refSpeed matches the heatmap's per-frame normalization, so the picture
     // shows structure while magnitude lives in the readout.
     drawVectors(ctx, g, f.u, f.v, {
       ...defaultVectorOptions,
-      spacingPx: 20,
-      scale: 13,
-      headSize: 3,
-      color: 'rgba(255, 255, 255, 0.85)',
+      spacingPx: 26 * dpr,
+      scale: 14 * dpr,
+      headSize: 3.5 * dpr,
+      lineWidth: dpr,
+      color: 'rgba(255, 255, 255, 0.62)',
       refSpeed: maxSpeed,
     });
 
     return { maxSpeed, divMax };
+  }
+
+  /**
+   * Paint solid cells over the field, after the heatmap and before the arrows.
+   * Inside a solid no view is showing data, so masking it beats inviting the
+   * reader to see structure in it. Drawn as the RASTERIZED cells, staircase and
+   * all: the staircase is what the solver actually sees — it pins the
+   * separation points — so a smooth circle would misrepresent the result.
+   *
+   * ONE path filled ONCE, not a fillRect per cell. Cell edges land on
+   * fractional pixels, and two separate fills sharing such a pixel composite to
+   * 1-(1-a)(1-b) < 1, letting the background bleed through as a thin seam — a
+   * visible grid of stripes across the body. Filling the union computes that
+   * pixel's coverage a single time, so interior edges disappear.
+   */
+  private drawSolids(ctx: CanvasRenderingContext2D, g: Grid, label: Uint8Array): void {
+    const h = ctx.canvas.height;
+    const cw = ctx.canvas.width / g.nx;
+    const ch = h / g.ny;
+
+    ctx.beginPath();
+    for (let j = 0; j < g.ny; j++) {
+      // Same y flip as Heatmap.draw and gridToScreen.
+      const y = h - (j + 1) * ch;
+      for (let i = 0; i < g.nx; i++) {
+        if (label[idxP(g, i, j)] === Cell.Solid) ctx.rect(i * cw, y, cw, ch);
+      }
+    }
+    // Pale, not black: black reads as a hole in the background, and a light
+    // body stays legible under both the dark dye view and the dark-at-zero
+    // vorticity map. It is also what reference images of this benchmark use.
+    ctx.fillStyle = '#b4becc';
+    ctx.fill();
   }
 }

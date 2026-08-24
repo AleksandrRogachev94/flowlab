@@ -39,6 +39,8 @@ export interface VectorOptions {
   color: string;
   /** arrowhead size in pixels; 0 draws bare line segments */
   headSize: number;
+  /** stroke width in pixels; scale it with the rest on a retina canvas */
+  lineWidth?: number;
   /**
    * Speed mapping to a full-length arrow. Pass the frame's max to make length
    * RELATIVE, keeping the picture's shape as the flow decays; omit for
@@ -159,7 +161,7 @@ export function drawVectors(
   const h = ctx.canvas.height;
 
   ctx.strokeStyle = opts.color;
-  ctx.lineWidth = 1;
+  ctx.lineWidth = opts.lineWidth ?? 1;
   ctx.beginPath(); // one path for every arrow — stroke() once at the end
 
   if (opts.mode === 'cell') {

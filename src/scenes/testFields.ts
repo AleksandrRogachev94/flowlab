@@ -6,8 +6,11 @@
  * sampled analytic derivatives, so div(curl(psi)) cancels exactly (1e-16)
  * instead of to O(h^2). Tolerances stay tight enough to blame the solver.
  *
- * Assumes the unit square (h = 1/nx, nx === ny). Both potentials give zero
- * normal velocity at the walls, so total divergence sums to 0 as the
+ * The domain is one unit TALL and W = nx*h units wide (Simulation sets
+ * h = 1/ny). Everything below is written against W rather than against 1, so a
+ * seed places itself the same way in a square box and in a wide one; on a
+ * square grid W = 1 and every formula reduces to what it was. Both potentials
+ * give zero normal velocity at the walls, so total divergence sums to 0 as the
  * pressure solve requires. Frequencies differ on purpose: same frequency
  * makes curl and grad exact negatives that cancel to nothing.
  *
@@ -48,9 +51,14 @@ export function addCurlOfStream(
     for (let i = 0; i < g.nx; i++) v[idxV(g, i, j)] += -inv * (psi(i + 1, j) - psi(i, j));
 }
 
-/** Divergence-free part: u = curl(psi), psi = sin(pi x) sin(pi y) at corners. */
+/** Domain width in world units; the height is always 1. */
+const widthOf = (g: Grid): number => g.nx * g.h;
+
+/** Divergence-free part: u = curl(psi), one half-period of sine per axis, so
+ *  psi vanishes on all four walls whatever the aspect ratio. */
 export function addRotational(g: Grid, u: FieldArray, v: FieldArray, amp = 1): void {
-  addCurlOfStream(g, u, v, (i, j) => Math.sin(PI * i * g.h) * Math.sin(PI * j * g.h), amp);
+  const w = widthOf(g);
+  addCurlOfStream(g, u, v, (i, j) => Math.sin((PI * i * g.h) / w) * Math.sin(PI * j * g.h), amp);
 }
 
 /**
@@ -71,7 +79,13 @@ export function addRotational(g: Grid, u: FieldArray, v: FieldArray, amp = 1): v
  *
  * ADDs, like the velocity seeds: overlapping disks sum past 1.
  */
-export function addDyeDisk(g: Grid, dye: FieldArray, r = 0.15, cx = 0.5, cy = 0.5): void {
+export function addDyeDisk(
+  g: Grid,
+  dye: FieldArray,
+  r = 0.15,
+  cx = 0.5 * widthOf(g),
+  cy = 0.5,
+): void {
   for (let j = 0; j < g.ny; j++) {
     const y = (j + 0.5) * g.h;
     for (let i = 0; i < g.nx; i++) {
@@ -109,11 +123,12 @@ export function addDyeMono(g: Grid, dye: FieldArray[], r = 0.15): void {
  * legible — and the thing to watch when a higher-order scheme lands.
  */
 export function addDyeTriad(g: Grid, dye: FieldArray[], r = 0.13, d = 0.12): void {
+  const cx = 0.5 * widthOf(g);
   for (let c = 0; c < dye.length; c++) {
     // Start at 90 deg so the red disk sits on top, then step by a full turn
     // divided between the channels.
     const a = PI / 2 + (2 * PI * c) / dye.length;
-    addDyeDisk(g, dye[c], r, 0.5 + d * Math.cos(a), 0.5 + d * Math.sin(a));
+    addDyeDisk(g, dye[c], r, cx + d * Math.cos(a), 0.5 + d * Math.sin(a));
   }
 }
 
@@ -134,8 +149,9 @@ export function addDyeTriad(g: Grid, dye: FieldArray[], r = 0.13, d = 0.12): voi
  */
 export function addVortexPair(g: Grid, u: FieldArray, v: FieldArray, amp = 1, sigma = 0.08): void {
   const k = sigma / (Math.SQRT2 * Math.exp(-0.5));
-  const blob = (x: number, y: number, cx: number, cy: number) =>
-    Math.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (sigma * sigma));
+  const cx = 0.5 * widthOf(g);
+  const blob = (x: number, y: number, bx: number, by: number) =>
+    Math.exp(-((x - bx) ** 2 + (y - by) ** 2) / (sigma * sigma));
 
   addCurlOfStream(
     g,
@@ -144,7 +160,7 @@ export function addVortexPair(g: Grid, u: FieldArray, v: FieldArray, amp = 1, si
     (i, j) => {
       const x = i * g.h;
       const y = j * g.h;
-      return k * (blob(x, y, 0.35, 0.3) - blob(x, y, 0.65, 0.3));
+      return k * (blob(x, y, cx - 0.15, 0.3) - blob(x, y, cx + 0.15, 0.3));
     },
     amp,
   );
@@ -189,15 +205,16 @@ export function addVortexCluster(
   // 3.5 sigma of margin puts the blobs' wall value near 2e-6 — small enough
   // that wall-normal velocity stays negligible. See addVortexPair.
   const margin = 3.5 * sigma;
-  const span = 1 - 2 * margin;
+  const spanX = widthOf(g) - 2 * margin;
+  const spanY = 1 - 2 * margin;
   const rand = lcg(seed);
 
   const cx = new Float64Array(count);
   const cy = new Float64Array(count);
   const sign = new Float64Array(count);
   for (let n = 0; n < count; n++) {
-    cx[n] = margin + rand() * span;
-    cy[n] = margin + rand() * span;
+    cx[n] = margin + rand() * spanX;
+    cy[n] = margin + rand() * spanY;
     sign[n] = n % 2 === 0 ? 1 : -1;
   }
 
@@ -226,8 +243,9 @@ export function addVortexCluster(
  */
 export function addGradient(g: Grid, u: FieldArray, v: FieldArray, amp = 1): void {
   const inv = amp / g.h;
+  const w = widthOf(g);
   const phi = (i: number, j: number) =>
-    Math.cos(2 * PI * (i + 0.5) * g.h) * Math.cos(2 * PI * (j + 0.5) * g.h);
+    Math.cos((2 * PI * (i + 0.5) * g.h) / w) * Math.cos(2 * PI * (j + 0.5) * g.h);
 
   for (let j = 0; j < g.ny; j++)
     for (let i = 1; i < g.nx; i++) u[idxU(g, i, j)] += inv * (phi(i, j) - phi(i - 1, j));

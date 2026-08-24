@@ -8,15 +8,19 @@
   </head>
   <body>
     <main>
-      <h1>Stable Fluids</h1>
-      <canvas id="view" width="756" height="756"></canvas>
-      <div class="controls">
-        <button id="restart" type="button">Restart (R)</button>
-        <button id="toggleView" type="button">View (D)</button>
-        <button id="nextScene" type="button">Scene (S)</button>
-        <button id="nextTracer" type="button">Dye (T)</button>
-      </div>
-      <pre id="readout">hover the grid</pre>
+      <header>
+        <h1>Stable Fluids</h1>
+        <div class="controls">
+          <button id="restart" type="button">Restart (R)</button>
+          <button id="toggleView" type="button">View (D)</button>
+          <button id="nextScene" type="button">Scene (S)</button>
+          <button id="nextTracer" type="button">Dye (T)</button>
+        </div>
+      </header>
+      <!-- #stage is what main.ts measures to size the canvas. The canvas is
+           taken out of flow so it can never feed back into that measurement. -->
+      <div id="stage"><canvas id="view"></canvas></div>
+      <pre id="readout"></pre>
     </main>
     <script type="module" src="/src/main.ts"></script>
   </body>

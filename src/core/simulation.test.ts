@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Simulation } from './simulation.ts';
+import { optimalOmega, Simulation } from './simulation.ts';
 import { addVortexCluster, addVortexPair } from '../scenes/testFields.ts';
 
 test('a long run stays finite and keeps removing divergence', () => {
-  const sim = new Simulation(32, { pressureIters: 40 });
-  sim.reset(addVortexPair);
+  const sim = new Simulation(32, 32, { pressureIters: 40 });
+  sim.reset({ seed: addVortexPair });
 
   for (let n = 0; n < 200; n++) sim.step();
 
@@ -18,8 +18,8 @@ test('a long run stays finite and keeps removing divergence', () => {
 });
 
 test('dt respects the CFL target and the dtMax cap', () => {
-  const sim = new Simulation(32, { cflTarget: 1.0, dtMax: 1 / 30 });
-  sim.reset(addVortexPair);
+  const sim = new Simulation(32, 32, { cflTarget: 1.0, dtMax: 1 / 30 });
+  sim.reset({ seed: addVortexPair });
 
   for (let n = 0; n < 50; n++) {
     sim.step();
@@ -30,10 +30,10 @@ test('dt respects the CFL target and the dtMax cap', () => {
 });
 
 test('reset makes a run reproducible — required for comparing schemes', () => {
-  const a = new Simulation(24, { pressureIters: 20 });
-  const b = new Simulation(24, { pressureIters: 20 });
-  a.reset(addVortexCluster);
-  b.reset(addVortexCluster);
+  const a = new Simulation(24, 24, { pressureIters: 20 });
+  const b = new Simulation(24, 24, { pressureIters: 20 });
+  a.reset({ seed: addVortexCluster });
+  b.reset({ seed: addVortexCluster });
 
   for (let n = 0; n < 25; n++) {
     a.step();
@@ -48,11 +48,8 @@ test('reset makes a run reproducible — required for comparing schemes', () => 
 test('dye decay is exponential in TIME, not per step', () => {
   // Zero velocity: advection is the identity at cell centres, so the only
   // thing acting on dye is the decay — and the answer is exact.
-  const sim = new Simulation(16, { dyeDecay: 2 });
-  sim.reset(
-    () => {},
-    (g, dye) => dye[0].fill(1),
-  );
+  const sim = new Simulation(16, 16, { dyeDecay: 2 });
+  sim.reset({ dye: (g, dye) => dye[0].fill(1) });
 
   for (let n = 0; n < 30; n++) sim.step();
 
@@ -61,4 +58,12 @@ test('dye decay is exponential in TIME, not per step', () => {
     Math.abs(sim.f.dye[0][0] - expected) < 1e-12,
     `dye ${sim.f.dye[0][0]} after t=${sim.time}, expected ${expected}`,
   );
+});
+
+test('optimalOmega reduces to 2/(1+sin(pi/n)) on a square grid', () => {
+  for (const n of [16, 64, 256]) {
+    assert.ok(Math.abs(optimalOmega(n, n) - 2 / (1 + Math.sin(Math.PI / n))) < 1e-12);
+  }
+  // A channel is not square, and the aspect ratio genuinely moves the optimum.
+  assert.ok(optimalOmega(512, 128) > optimalOmega(128, 128));
 });

@@ -1,4 +1,4 @@
-import { idxP, idxU, idxV, isSolid, type FieldArray, type Grid } from './grid.ts';
+import { idxP, idxU, idxV, isSolidOrOutside, type FieldArray, type Grid } from './grid.ts';
 
 /**
  * Applies u^{n+1} = u* - (dt / (rho * h)) * grad(p), making the field
@@ -19,7 +19,7 @@ import { idxP, idxU, idxV, isSolid, type FieldArray, type Grid } from './grid.ts
  *      since u has no wall condition tied to j
  *   v: i in [0, nx-1], j in [1, ny-1] — symmetric, unbounded in i
  * plus, for interior obstacles: skip a face if EITHER adjacent cell is
- * solid, via isSolid() (currently only true outside the domain, so this is
+ * solid, via isSolidOrOutside() (currently only true outside the domain, so this is
  * a no-op until Step 3 paints obstacles — but the check costs nothing now
  * and removes a whole bug class later).
  *
@@ -47,14 +47,14 @@ export function subtractGradient(
 ): void {
   for (let j = 0; j < g.ny; j += 1) {
     for (let i = 1; i < g.nx; i += 1) {
-      if (isSolid(g, label, i - 1, j) || isSolid(g, label, i, j)) continue;
+      if (isSolidOrOutside(g, label, i - 1, j) || isSolidOrOutside(g, label, i, j)) continue;
       u[idxU(g, i, j)] -= gradScale * (p[idxP(g, i, j)] - p[idxP(g, i - 1, j)]);
     }
   }
 
   for (let j = 1; j < g.ny; j += 1) {
     for (let i = 0; i < g.nx; i += 1) {
-      if (isSolid(g, label, i, j - 1) || isSolid(g, label, i, j)) continue;
+      if (isSolidOrOutside(g, label, i, j - 1) || isSolidOrOutside(g, label, i, j)) continue;
       v[idxV(g, i, j)] -= gradScale * (p[idxP(g, i, j)] - p[idxP(g, i, j - 1)]);
     }
   }

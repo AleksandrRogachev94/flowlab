@@ -2,7 +2,7 @@ import {
   idxP,
   idxU,
   idxV,
-  isSolid,
+  isSolidOrOutside,
   sampleP,
   sampleU,
   sampleV,
@@ -46,7 +46,7 @@ export function advectVelocity(
     const y = (j + 0.5) * h;
     for (let i = 0; i <= g.nx; i++) {
       const k = idxU(g, i, j);
-      if (isSolid(g, label, i - 1, j) || isSolid(g, label, i, j)) {
+      if (isSolidOrOutside(g, label, i - 1, j) || isSolidOrOutside(g, label, i, j)) {
         uOut[k] = uIn[k];
         continue;
       }
@@ -63,7 +63,7 @@ export function advectVelocity(
     const y = j * h;
     for (let i = 0; i < g.nx; i++) {
       const k = idxV(g, i, j);
-      if (isSolid(g, label, i, j - 1) || isSolid(g, label, i, j)) {
+      if (isSolidOrOutside(g, label, i, j - 1) || isSolidOrOutside(g, label, i, j)) {
         vOut[k] = vIn[k];
         continue;
       }
@@ -106,7 +106,7 @@ export function advectScalar(
     const y = (j + 0.5) * h;
     for (let i = 0; i < g.nx; i++) {
       const k = idxP(g, i, j);
-      if (isSolid(g, label, i, j)) {
+      if (isSolidOrOutside(g, label, i, j)) {
         qOut[k] = qIn[k];
         continue;
       }
