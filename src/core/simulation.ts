@@ -15,6 +15,14 @@ export type Seed = (g: Grid, u: FieldArray, v: FieldArray) => void;
  */
 export type DyeSeed = (g: Grid, dye: FieldArray[]) => void;
 
+/**
+ * Re-imposed every step: a seed is initial data, a source is a boundary
+ * condition on the tracer that advection keeps carrying away. `dt` is there
+ * for sources that inject at a rate; one holding a region at a fixed value
+ * ignores it.
+ */
+export type DyeSource = (g: Grid, dye: FieldArray[], dt: number) => void;
+
 export interface SimulationParams {
   /**
    * Target for CFL = u_max * dt / h. Semi-Lagrangian is stable at any dt, so
@@ -40,6 +48,18 @@ export interface SimulationParams {
    */
   omega: number;
   rho: number;
+  /**
+   * Dye fade, per second of sim time; 0 is off. Half-life is ln2 / dyeDecay.
+   * Only matters with a source: a permanent source in a recirculating box
+   * saturates every cell eventually, and decay is what turns dye from "has
+   * this fluid ever been near the nozzle" into "how recently was it".
+   *
+   * Independent of N: the step applies exp(-dyeDecay * dt), so elapsed SIM
+   * TIME sets the fade, not the number of steps taken to cover it. The scene
+   * knob worth thinking in is a distance — dye fades to 1/e after travelling
+   * U / dyeDecay, so pick that first and divide.
+   */
+  dyeDecay: number;
 }
 
 /** Classical optimal SOR factor for an n x n Poisson problem. */
@@ -50,10 +70,11 @@ export function optimalOmega(n: number): number {
 export const defaultParams: SimulationParams = {
   cflTarget: 2.0, // initially it was 1. Bridson's book mentions 5.
   dtMax: 1 / 30,
-  pressureIters: 500,
+  pressureIters: 1000,
   tol: 5e-3, // initially it was 1e-3. TODO tune!!!
   omega: 0, // replaced by optimalOmega(n) in the constructor
   rho: 1.0,
+  dyeDecay: 0,
 };
 
 /**
@@ -79,6 +100,9 @@ export class Simulation {
   private vNext: FieldArray;
   private dyeNext: FieldArray[];
 
+  /** Set by reset(), so switching scenes can't leave an emitter running. */
+  private dyeSource: DyeSource | null = null;
+
   constructor(n: number, params: Partial<SimulationParams> = {}) {
     this.params = { ...defaultParams, omega: optimalOmega(n), ...params };
     this.g = createGrid(n, n, 1 / n);
@@ -91,14 +115,17 @@ export class Simulation {
 
   /** Back to t = 0. Clears p too, or the warm start begins from a field
    *  solving a different problem. Dye seeding is optional — a headless
-   *  numerics run has no use for a tracer. */
-  reset(seed: Seed, dyeSeed?: DyeSeed): void {
+   *  numerics run has no use for a tracer. A source is applied once here too
+   *  (dt = 0), since a boundary condition must already hold at t = 0. */
+  reset(seed: Seed, dyeSeed?: DyeSeed, dyeSource?: DyeSource): void {
     this.f.u.fill(0);
     this.f.v.fill(0);
     this.f.p.fill(0);
     for (const c of this.f.dye) c.fill(0);
     seed(this.g, this.f.u, this.f.v);
     dyeSeed?.(this.g, this.f.dye);
+    this.dyeSource = dyeSource ?? null;
+    this.dyeSource?.(this.g, this.f.dye, 0);
     this.time = 0;
     this.dt = 0;
   }
@@ -141,6 +168,18 @@ export class Simulation {
       advectScalar(g, f.u, f.v, f.dye[c], this.dyeNext[c], f.label, dt);
       [f.dye[c], this.dyeNext[c]] = [this.dyeNext[c], f.dye[c]];
     }
+
+    // Decay BEFORE the source, so the source region stays exactly at its set
+    // value. Exponential in dt, not a fixed factor per step, or the fade rate
+    // would change with the timestep.
+    if (p.dyeDecay > 0) {
+      const keep = Math.exp(-p.dyeDecay * dt);
+      for (const c of f.dye) for (let k = 0; k < c.length; k++) c[k] *= keep;
+    }
+
+    // After advection, not before: the source must hold its value at the END
+    // of the step, or the stamp is carried off within the same step.
+    this.dyeSource?.(g, f.dye, dt);
 
     this.dt = dt;
     this.time += dt;

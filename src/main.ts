@@ -1,4 +1,5 @@
-import { Simulation, type DyeSeed, type Seed } from './core/simulation.ts';
+import { Simulation, type DyeSeed, type DyeSource, type Seed } from './core/simulation.ts';
+import { wallJet } from './scenes/emitters.ts';
 import { addDyeMono, addDyeTriad, addVortexCluster, addVortexPair } from './scenes/testFields.ts';
 import { FieldView, VIEWS } from './viz/fieldView.ts';
 
@@ -11,10 +12,19 @@ const readout = document.querySelector<HTMLPreElement>('#readout')!;
  *           things the right way at all.
  * 'cluster' interacting vortices that stretch filaments and merge — the scene
  *           for comparing schemes. Deterministic, so two runs are comparable.
+ * 'jet'     steady inflow through part of the left wall, dye injected at the
+ *           nozzle — the first scene that is DRIVEN rather than left to decay.
+ *           A confined jet entrains, so the box recirculates and a permanent
+ *           source would saturate every cell; `decay` is what keeps it legible.
+ *           Tune it as a DISTANCE: k = speed / fadeLength, so 0.5 at speed 1
+ *           fades dye to 1/e after two domain widths of travel. That is
+ *           resolution-independent — see SimulationParams.dyeDecay.
  */
-const SCENES: { name: string; seed: Seed }[] = [
+const jet = wallJet();
+const SCENES: { name: string; seed: Seed; source?: DyeSource; decay?: number }[] = [
   { name: 'dipole', seed: addVortexPair },
   { name: 'cluster', seed: addVortexCluster },
+  { name: 'jet', seed: jet.seed, source: jet.source, decay: 0.5 },
 ];
 
 /**
@@ -25,13 +35,15 @@ const SCENES: { name: string; seed: Seed }[] = [
  *         show up as colours that were never seeded.
  * 'mono'  one white disk. The control: same advection, no mixing signal, so
  *         it isolates how much of the picture the colour is really carrying.
+ * 'none'  empty, for scenes that inject their own dye.
  */
-const TRACERS: { name: string; seed: DyeSeed }[] = [
+const TRACERS: { name: string; seed?: DyeSeed }[] = [
   { name: 'triad', seed: addDyeTriad },
   { name: 'mono', seed: addDyeMono },
+  { name: 'none' },
 ];
 
-const sim = new Simulation(512);
+const sim = new Simulation(128);
 const fieldView = new FieldView(sim.g);
 
 let sceneIndex = 0;
@@ -39,13 +51,20 @@ let viewIndex = 0;
 let tracerIndex = 0;
 
 function restart(): void {
-  sim.reset(SCENES[sceneIndex].seed, TRACERS[tracerIndex].seed);
+  const scene = SCENES[sceneIndex];
+  sim.params.dyeDecay = scene.decay ?? 0;
+  sim.reset(scene.seed, TRACERS[tracerIndex].seed, scene.source);
 }
 function toggleView(): void {
   viewIndex = (viewIndex + 1) % VIEWS.length;
 }
 function nextScene(): void {
   sceneIndex = (sceneIndex + 1) % SCENES.length;
+  // A scene with its own dye source seeds its own dye; layering a tracer
+  // preset underneath it would only show up outside the source's band.
+  if (SCENES[sceneIndex].source) {
+    tracerIndex = TRACERS.findIndex((t) => t.name === 'none');
+  }
   restart();
 }
 // Reseeding is the only way to change tracer: dye already in the domain was

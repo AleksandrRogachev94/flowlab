@@ -44,3 +44,21 @@ test('reset makes a run reproducible — required for comparing schemes', () => 
   }
   assert.equal(a.time, b.time);
 });
+
+test('dye decay is exponential in TIME, not per step', () => {
+  // Zero velocity: advection is the identity at cell centres, so the only
+  // thing acting on dye is the decay — and the answer is exact.
+  const sim = new Simulation(16, { dyeDecay: 2 });
+  sim.reset(
+    () => {},
+    (g, dye) => dye[0].fill(1),
+  );
+
+  for (let n = 0; n < 30; n++) sim.step();
+
+  const expected = Math.exp(-2 * sim.time);
+  assert.ok(
+    Math.abs(sim.f.dye[0][0] - expected) < 1e-12,
+    `dye ${sim.f.dye[0][0]} after t=${sim.time}, expected ${expected}`,
+  );
+});
