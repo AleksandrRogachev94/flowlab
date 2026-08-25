@@ -1,3 +1,4 @@
+import { CpuAdvector } from './core/advector.ts';
 import {
   cpuPressureSolver,
   cpuRedBlackSolver,
@@ -6,6 +7,7 @@ import {
 import { Profiler } from './core/profiler.ts';
 import { Simulation, type DyeSeed, type DyeSource, type SceneSpec } from './core/simulation.ts';
 import { describeGpu, initGpu } from './gpu/device.ts';
+import { GpuAdvector } from './gpu/advectGpu.ts';
 import { GpuPressureSolver } from './gpu/pressureGpu.ts';
 import { karmanChannel } from './scenes/karman.ts';
 import { wallJet } from './scenes/emitters.ts';
@@ -42,15 +44,14 @@ const readout = document.querySelector<HTMLPreElement>('#readout')!;
  *   640x360   395.6      62.8     228.8    100.8        3.3
  *
  * What sets the ceiling has MOVED, and that is the part to keep in mind when
- * changing NX/NY. Those are CPU-solver numbers: with the GPU solver on (G) the
- * pressure column collapses to single-digit ms and stops being the limit at
- * any of these sizes. Advection and dye then account for ~95% of what is left.
- * Both are semi-Lagrangian gathers — the same shape as the solve that just
- * ported well — so the next resolution step is two more shaders, not a better
- * solver. Past ~1024 it is BOTH: see docs/WEBGPU.md §6.
+ * changing NX/NY. Those are all-CPU numbers, and both of the big columns have
+ * since gone to the device: advect and dye now cost ~5.7 and ~3.5 ms at
+ * 640x480 (docs/WEBGPU.md §8), and the pressure solve is ~60% of the step
+ * again. The next resolution step is therefore a better SOLVER, not another
+ * shader — see docs/WEBGPU.md §6.
  */
-const NX = 640;
-const NY = 480;
+const NX = 1024;
+const NY = 768;
 
 /**
  * A FIXED sweep budget, not a convergence tolerance — the real-time half of
@@ -222,6 +223,11 @@ void initGpu().then((ctx) => {
   gpuName = describeGpu(ctx);
   SOLVERS.push(gpuSolver);
   sim.solver = gpuSolver;
+  // Not on the G cycle: G exists to compare pressure SOLVERS, and swapping
+  // advection underneath it would stop that being one variable at a time.
+  // Advection has no algorithmic choice to make here — the GPU kernel is the
+  // same scheme A already toggles — so it simply takes over when available.
+  sim.advector = new GpuAdvector(ctx, sim.g);
 });
 
 /**
@@ -232,10 +238,11 @@ void initGpu().then((ctx) => {
  */
 function dropGpu(why: string): void {
   if (!gpuSolver) return;
-  console.error(`[gpu] falling back to the CPU solver: ${why}`);
+  console.error(`[gpu] falling back to the CPU: ${why}`);
   SOLVERS.pop();
   gpuSolver = null;
   sim.solver = cpuPressureSolver;
+  sim.advector = new CpuAdvector(sim.g);
 }
 
 function toggleSolver(): void {
@@ -364,7 +371,8 @@ async function frame(): Promise<void> {
 
   readout.textContent =
     `scene ${SCENES[sceneIndex].name} (S)   view ${VIEWS[viewIndex]} (D)   ` +
-    `dye ${TRACERS[tracerIndex].name} (T)   advect ${sim.params.scheme} (A)   ` +
+    `dye ${TRACERS[tracerIndex].name} (T)   ` +
+    `advect ${sim.params.scheme}/${sim.advector.name} (A)   ` +
     `solver ${sim.solver.name} (G)   perf (P)   grid ${sim.g.nx}x${sim.g.ny}\n` +
     `t ${sim.time.toFixed(2)}   max speed ${maxSpeed.toFixed(3)}   ` +
     `dt ${sim.dt.toExponential(2)} (CFL ${sim.cfl.toFixed(2)})   ` +

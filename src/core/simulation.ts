@@ -1,10 +1,5 @@
-import {
-  advectScalar,
-  advectScalarMacCormack,
-  advectVelocity,
-  advectVelocityMacCormack,
-  type AdvectionScheme,
-} from './advect.ts';
+import type { AdvectionScheme } from './advect.ts';
+import { CpuAdvector, type Advector } from './advector.ts';
 import { applyOutflow, commitLabels } from './boundaries.ts';
 import { computeDivergence } from './divergence.ts';
 import { Cell, createFields, createGrid, type FieldArray, type Fields, type Grid } from './grid.ts';
@@ -146,17 +141,14 @@ export class Simulation {
    * params.scheme already uses for advection.
    */
   solver: PressureSolver = cpuPressureSolver;
+  /** Swappable for the same reason, and on the same terms — see Advector. */
+  advector: Advector;
 
   // Rule 3: advection can't run in place (u self-advects), so these are
   // allocated once and ping-ponged by reference swap, never copied.
   private uNext: FieldArray;
   private vNext: FieldArray;
   private dyeNext: FieldArray[];
-  // MacCormack's forward pass, kept so the correction can compare against it.
-  // One dye buffer is enough for all channels: they are advected one at a time.
-  private uHat: FieldArray;
-  private vHat: FieldArray;
-  private dyeHat: FieldArray;
 
   /** Set by reset(), so switching scenes can't leave an emitter running. */
   private dyeSource: DyeSource | null = null;
@@ -177,9 +169,7 @@ export class Simulation {
     this.uNext = new Float64Array(this.f.u.length);
     this.vNext = new Float64Array(this.f.v.length);
     this.dyeNext = this.f.dye.map(() => new Float64Array(this.f.p.length));
-    this.uHat = new Float64Array(this.f.u.length);
-    this.vHat = new Float64Array(this.f.v.length);
-    this.dyeHat = new Float64Array(this.f.p.length);
+    this.advector = new CpuAdvector(this.g);
   }
 
   /**
@@ -213,12 +203,21 @@ export class Simulation {
     this.dt = 0;
   }
 
-  /** Largest face velocity — what bounds CFL, since the backtrace samples
-   *  faces. Not the cell-centred speed used for display. */
+  /**
+   * Largest face velocity — what bounds CFL, since the backtrace samples
+   * faces. Not the cell-centred speed used for display.
+   *
+   * Indexed loops, NOT `for (const x of ...)`. On a typed array the iterator
+   * protocol is not free and V8 does not always see through it: over the 1.6M
+   * faces of a 1024x768 grid, for-of measured 9.9 ms against 0.8 ms indexed —
+   * per step, on the CPU, inside the `advect` phase. That was more than the
+   * whole GPU advection it sat next to.
+   */
   maxFaceSpeed(): number {
+    const { u, v } = this.f;
     let m = 0;
-    for (const x of this.f.u) m = Math.max(m, Math.abs(x));
-    for (const x of this.f.v) m = Math.max(m, Math.abs(x));
+    for (let k = 0; k < u.length; k++) m = Math.max(m, Math.abs(u[k]));
+    for (let k = 0; k < v.length; k++) m = Math.max(m, Math.abs(v[k]));
     return m;
   }
 
@@ -238,21 +237,7 @@ export class Simulation {
     const scale = (p.rho * g.h * g.h) / dt;
     const gradScale = dt / (p.rho * g.h);
 
-    if (p.scheme === 'macCormack') {
-      advectVelocityMacCormack(
-        g,
-        f.u,
-        f.v,
-        this.uHat,
-        this.vHat,
-        this.uNext,
-        this.vNext,
-        f.label,
-        dt,
-      );
-    } else {
-      advectVelocity(g, f.u, f.v, this.uNext, this.vNext, f.label, dt);
-    }
+    await this.advector.velocity(g, p.scheme, f.u, f.v, this.uNext, this.vNext, f.label, dt);
     [f.u, this.uNext] = [this.uNext, f.u];
     [f.v, this.vNext] = [this.vNext, f.v];
     this.perf.mark('advect');
@@ -286,14 +271,10 @@ export class Simulation {
     // artificially concentrate or thin the tracer. Passive, so nothing here
     // feeds back into u/v and the step is otherwise unaffected by it.
     //
-    // Channels are fully independent — same velocity, no coupling — so this is
-    // a plain loop rather than anything vector-valued.
+    // Channels are fully independent — same velocity, no coupling — which is
+    // what lets the GPU advector carry all three on one backtrace.
+    await this.advector.dye(g, p.scheme, f.u, f.v, f.dye, this.dyeNext, f.label, dt);
     for (let c = 0; c < f.dye.length; c++) {
-      if (p.scheme === 'macCormack') {
-        advectScalarMacCormack(g, f.u, f.v, f.dye[c], this.dyeHat, this.dyeNext[c], f.label, dt);
-      } else {
-        advectScalar(g, f.u, f.v, f.dye[c], this.dyeNext[c], f.label, dt);
-      }
       [f.dye[c], this.dyeNext[c]] = [this.dyeNext[c], f.dye[c]];
     }
 

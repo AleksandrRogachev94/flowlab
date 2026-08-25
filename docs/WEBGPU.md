@@ -1,8 +1,9 @@
-# The WebGPU port, step 1: the pressure solve
+# The WebGPU port
 
-Everything else in this project runs on the CPU. This document covers the one
-piece that does not, why that piece was chosen, and the one thing that went
-wrong.
+Two pieces of the step run on the device: the **pressure solve** (§1-§5) and
+**advection and dye** (§8). Everything else is still CPU. This document covers
+why those pieces were chosen, how they are put together, and the one thing
+that went wrong.
 
 ---
 
@@ -293,10 +294,123 @@ tuning problem.
 
 ## 7. Order of work
 
-1. **Advection and dye to the device.** They are 84% of the frame at 640×480
-   and are semi-Lagrangian gathers — perfectly parallel, no new ideas needed.
-   Biggest win available, and it needs doing before the solver matters again.
-2. **Keep the fields resident.** Once advection is on the device, `p`, `u`, `v`
-   and `dye` stop round-tripping and the upload/readback here disappears.
+1. ~~**Advection and dye to the device.**~~ Done — §8.
+2. **Keep the fields resident.** Three round trips per frame is two more than
+   necessary; see the end of §8 for what has to move first.
 3. **CPU conjugate gradient**, as the converged reference (PLAN.md §8).
 4. **Multigrid**, CPU first, then the two extra shaders.
+
+---
+
+## 8. Step 2: advection and dye
+
+`advect.wgsl` is the counterpart of `core/advect.ts`, behind an `Advector`
+interface built on the same terms as `PressureSolver`: one CPU implementation,
+one GPU implementation, swappable at runtime, and `Simulation.step()` cannot
+tell which one ran.
+
+It is one interface with **two methods**, `velocity()` and `dye()`, because
+the two calls sit on opposite sides of the pressure solve — velocity advects
+`u^n`, dye rides the projected `u^{n+1}`. They are otherwise the same kernel,
+which is why one object owns both.
+
+### One binding layout, six entry points
+
+Every pass has the same shape — read a carrier velocity, read a source field,
+write one output — so the bindings never change. Only the entry point and the
+bind group do:
+
+| binding      | role                                                 |
+| ------------ | ---------------------------------------------------- |
+| `carU, carV` | the **carrier**: the velocity the backtrace follows  |
+| `src`        | the field **sampled** at the backtraced point        |
+| `orig`       | the field before the step; only `correct_*` reads it |
+| `dst`        | the output — never aliases any of the above          |
+| `label`      | Fluid/Air/Solid, widened to `u32` on upload          |
+
+That is what pays for an explicit `GPUBindGroupLayout` instead of the
+`layout: 'auto'` §2 recommends. Auto-layouts are distinct objects even when
+identical, so a bind group built for one pipeline is rejected by the next —
+and the whole point here is six pipelines sharing one layout and six bind
+groups. Self-advection binds `carU = src = uIn`; the correction binds
+`src = uHat`, `orig = uIn`. Nothing else moves.
+
+### MacCormack in two dispatches, not three
+
+The CPU does forward, reverse, then correction. The reverse pass's output is
+read **only at its own index** by the correction, so the two fuse into one
+kernel with no intermediate buffer:
+
+```
+qBar      = A_rev(qHat)             traced forward from this cell
+corrected = qHat + (q^n - qBar)/2
+dst       = clamp(corrected)        to the forward pass's donor stencil
+```
+
+Same arithmetic, one less pass over memory — and this kernel is
+memory-bandwidth bound, so the pass it saves is the thing that costs.
+
+### Three dye channels in one dispatch
+
+The backtrace is the expensive part and it does not depend on the channel. The
+CPU advects the channels one after another and pays for it three times; the
+shader backtraces once and gathers three values, so three channels cost barely
+more than one. The channels share a single buffer laid out end to end, which
+is also what keeps the binding count at six.
+
+### What the numbers say
+
+Same machine, same scene (karman 640×480, MacCormack, GPU pressure solver in
+both columns), from the in-app profiler — press **P**. Only the advector
+changed between the two runs:
+
+| phase      | CPU advector | GPU advector | speedup |
+| ---------- | ------------ | ------------ | ------- |
+| advect     | 83.4         | **5.7**      | ~15×    |
+| dye        | 135.8        | **3.5**      | ~39×    |
+| step (all) | 243.1        | **33.8**     | ~7×     |
+| frame      | 250.8        | **48.9**     | ~5×     |
+| fps        | 4.0          | **20.5**     |         |
+
+Those two runs are headless Chrome, whose CPU side is roughly half the speed
+of a windowed browser — in a window the same two phases read 44.4 and 66.5 ms.
+The RATIO is what transfers between the two; re-measure the absolutes.
+
+Two things worth reading out of it:
+
+1. **Dye gains more than velocity** (39× vs 15×), and that is the
+   one-dispatch, three-channel kernel rather than anything about the hardware.
+2. **Most of the remaining 5.7 ms is not the GPU.** A microbenchmark of the
+   phase alone — f64 → f32 conversion, upload, dispatch, readback, nothing
+   else — is 1.8 ms for velocity and 2.8 ms for dye at this size, of which
+   0.5–0.7 ms is upload. The rest of the profiler's `advect` row is host work
+   that never moved: `maxFaceSpeed()` scans every face, and the `dye` row
+   still carries the decay and the source stamp.
+
+**The pressure solve is 59% of the step again**, which is the position §6 was
+written for.
+
+### The three round trips, and what removes them
+
+`u` and `v` are uploaded twice per step, because `subtractGradient` runs on the
+host in between and the device's copy is stale by the time dye advects. Only
+`label` is genuinely shared: nothing between the two calls can change it, so
+`dye()` reuses the buffer `velocity()` filled. That is an ordering contract
+written into the `Advector` interface, not a hopeful assumption.
+
+Removing the rest is not a matter of tightening the plumbing. The uploads
+exist because `computeDivergence`, `subtractGradient`, `applyOutflow` and the
+dye source still run on the host — each is a ~20-line kernel, and porting them
+is what lets the fields stay resident and collapses three stalls into one. The
+shaders and bind groups are unchanged by that, which is why this was worth
+doing first.
+
+### The correctness gate
+
+`advect.gputest.ts` runs the shader on real hardware and diffs both schemes
+against `CpuAdvector`: 1.4e-7 relative on `u`, 1.2e-6 on dye. It exists
+because the MAC grid has three different extents — `(nx+1)*ny`, `nx*(ny+1)`,
+`nx*ny`, each with its own half-cell offset and its own bounds guard — and a
+swapped stride produces a picture that still flows, just half a cell wrong.
+`npm run test:gpu` runs it, serialised: two GPU test files cannot share the
+harness's fixed debug port.

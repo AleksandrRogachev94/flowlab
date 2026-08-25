@@ -13,7 +13,7 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test:gpu": "node --test 'src/**/*.gputest.ts'",
+    "test:gpu": "node --test --test-concurrency=1 'src/**/*.gputest.ts'",
     "bench": "node src/bench/step.ts"
   },
   "devDependencies": {
