@@ -23,6 +23,7 @@
  */
 
 import { idxP, idxU, idxV, type FieldArray, type Grid } from '../core/grid.ts';
+import type { DyeSource } from '../core/simulation.ts';
 
 const PI = Math.PI;
 
@@ -109,6 +110,87 @@ export function addDyeDisk(
  */
 export function addDyeMono(g: Grid, dye: FieldArray[], r = 0.15): void {
   for (const c of dye) addDyeDisk(g, c, r);
+}
+
+/**
+ * Horizontal bands across the whole domain — the strain map.
+ *
+ * Where addDyeTriad's three fat blobs answer "where did this fluid come from",
+ * many thin bands answer "how much has it been STRETCHED": every band edge is a
+ * material line, so the local spacing IS the strain field. Bands crowd where
+ * the flow accelerates and spread where it slows, since the flux between two
+ * material lines is conserved.
+ *
+ * The period is in CELLS because its useful lower bound is a resolution limit,
+ * not a physical length: below ~8 cells the strain thins bands past the grid
+ * within a few diameters and they alias into moire. Worth having only since
+ * MacCormack advection landed — semi-Lagrangian blurred a 12-cell period to
+ * flat grey almost immediately, which is why this was not a useful tracer
+ * before.
+ */
+export function addDyeStripes(g: Grid, dye: FieldArray[], periodCells = 12): void {
+  for (let j = 0; j < g.ny; j++) {
+    for (let c = 0; c < dye.length; c++) {
+      const v = stripeAt(g, j, periodCells, c, dye.length);
+      for (let i = 0; i < g.nx; i++) dye[c][idxP(g, i, j)] = v;
+    }
+  }
+}
+
+/**
+ * One channel's value at row j: a bright band times a hue.
+ *
+ * Two independent periods, and keeping them apart is the whole design.
+ *
+ *   BRIGHTNESS cycles every `periodCells` — many thin bands, squared so they
+ *   are narrow bright lines with dark gaps rather than a continuous wash. The
+ *   gaps are what let the eye follow ONE line through a vortex.
+ *
+ *   HUE cycles ONCE over the domain height, via the three channels offset by a
+ *   third of a cycle: red at the bottom, through green, to blue at the top.
+ *   Composited as RGB that is an ordinary cyclic colour ramp, built in the DATA
+ *   rather than in the renderer — which is how three scalars show far more than
+ *   three bands.
+ *
+ * Cycling hue per BAND instead (the obvious first try) looks striking and
+ * analyses nothing: every band is then the same rainbow, so colour reports
+ * position within a period and cannot say which band you are looking at. Tied
+ * to the domain instead, colour is a label a band keeps no matter how far the
+ * wake folds it — which is exactly the question a strain map has to answer.
+ *
+ * Sub-grid mixing still reads as desaturation, as in addDyeTriad: once bands
+ * interleave below the cell scale the channels average to their common mean.
+ */
+function stripeAt(g: Grid, j: number, periodCells: number, c: number, channels: number): number {
+  const band = 0.5 + 0.5 * Math.cos((2 * Math.PI * j) / periodCells);
+  const hue = 0.5 + 0.5 * Math.cos(2 * Math.PI * (j / g.ny - c / channels));
+  return band * band * hue;
+}
+
+/**
+ * addDyeStripes as a SOURCE — the same pattern re-stamped in the inlet columns
+ * every step, so bands keep arriving instead of washing out once.
+ *
+ * A seeded tracer is a transient in any scene with an outlet: every dyed
+ * particle leaves within one domain transit and nothing replaces it. That is
+ * fine in a closed box, where the fluid recirculates forever, and useless in a
+ * channel — which is exactly the scene where a strain map is most worth having.
+ *
+ * Assumes the WHOLE left edge is inflow, so it belongs to karman and not to a
+ * scene like wallJet where part of that edge is wall: stamping a wall cell
+ * pins dye against it with no flow to carry it away. main.ts gates this on
+ * SceneDef.inflow rather than guessing.
+ */
+export function stripeInflow(periodCells = 12, depthCells = 2): DyeSource {
+  return (g, dye) => {
+    const depth = Math.min(depthCells, g.nx);
+    for (let j = 0; j < g.ny; j++) {
+      for (let c = 0; c < dye.length; c++) {
+        const v = stripeAt(g, j, periodCells, c, dye.length);
+        for (let i = 0; i < depth; i++) dye[c][idxP(g, i, j)] = v;
+      }
+    }
+  };
 }
 
 /**

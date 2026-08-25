@@ -234,3 +234,68 @@ export function sampleP(g: Grid, q: FieldArray, x: number, y: number): number {
     fy,
   );
 }
+
+/**
+ * Clamp `q` into the range spanned by the four values bilinear interpolation
+ * would blend at (x, y) — the MacCormack limiter (Selle et al. 2008).
+ *
+ * Why it is needed at all: plain semi-Lagrangian cannot overshoot, because its
+ * output IS a bilinear blend of four inputs. MacCormack adds a correction term
+ * on top of that blend, and a correction is free to push the result outside
+ * the local data range — a new extremum that no upwind information supports,
+ * which is exactly how a second-order scheme goes unstable on a sharp front.
+ * Clamping to the donor stencil restores the bound at the cost of dropping
+ * back to first order wherever it bites (fronts, not smooth regions).
+ *
+ * Clamping rather than "revert to the uncorrected value" is the cheap variant
+ * of the same idea: the uncorrected value already lies inside this range, so
+ * clamping lands somewhere between it and the correction, never further out.
+ */
+function clampToRange(q: number, a: number, b: number, c: number, d: number): number {
+  return Math.min(Math.max(q, Math.min(a, b, c, d)), Math.max(a, b, c, d));
+}
+
+/** clampToRange over sampleU's stencil at (x, y). */
+export function clampToStencilU(g: Grid, u: FieldArray, x: number, y: number, q: number): number {
+  const { i0 } = clampedAxis(x / g.h, g.nx + 1);
+  const { i0: j0 } = clampedAxis(y / g.h - 0.5, g.ny);
+  return clampToRange(
+    q,
+    u[idxU(g, i0, j0)],
+    u[idxU(g, i0 + 1, j0)],
+    u[idxU(g, i0, j0 + 1)],
+    u[idxU(g, i0 + 1, j0 + 1)],
+  );
+}
+
+/** clampToRange over sampleV's stencil at (x, y). */
+export function clampToStencilV(g: Grid, v: FieldArray, x: number, y: number, q: number): number {
+  const { i0 } = clampedAxis(x / g.h - 0.5, g.nx);
+  const { i0: j0 } = clampedAxis(y / g.h, g.ny + 1);
+  return clampToRange(
+    q,
+    v[idxV(g, i0, j0)],
+    v[idxV(g, i0 + 1, j0)],
+    v[idxV(g, i0, j0 + 1)],
+    v[idxV(g, i0 + 1, j0 + 1)],
+  );
+}
+
+/** clampToRange over sampleP's stencil at (x, y). */
+export function clampToStencilP(
+  g: Grid,
+  q: FieldArray,
+  x: number,
+  y: number,
+  value: number,
+): number {
+  const { i0 } = clampedAxis(x / g.h - 0.5, g.nx);
+  const { i0: j0 } = clampedAxis(y / g.h - 0.5, g.ny);
+  return clampToRange(
+    value,
+    q[idxP(g, i0, j0)],
+    q[idxP(g, i0 + 1, j0)],
+    q[idxP(g, i0, j0 + 1)],
+    q[idxP(g, i0 + 1, j0 + 1)],
+  );
+}

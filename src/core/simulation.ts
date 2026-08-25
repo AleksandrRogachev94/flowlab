@@ -1,4 +1,10 @@
-import { advectScalar, advectVelocity } from './advect.ts';
+import {
+  advectScalar,
+  advectScalarMacCormack,
+  advectVelocity,
+  advectVelocityMacCormack,
+  type AdvectionScheme,
+} from './advect.ts';
 import { applyOutflow, commitLabels } from './boundaries.ts';
 import { computeDivergence } from './divergence.ts';
 import { Cell, createFields, createGrid, type FieldArray, type Fields, type Grid } from './grid.ts';
@@ -52,6 +58,13 @@ export interface SimulationParams {
    * CFL 0.13. The penalty is far steeper above 1 than below.
    */
   cflTarget: number;
+  /**
+   * 'semiLagrangian' — one backtrace, heavily dissipative.
+   * 'macCormack'     — three backtraces, second-order, far less dissipative.
+   * Switchable at runtime (it is read fresh each step), so one Simulation can
+   * be flipped mid-run and the two schemes compared on the same state.
+   */
+  scheme: AdvectionScheme;
   /** Cap, since a nearly-still flow would otherwise ask for an unbounded dt. */
   dtMax: number;
   /** Cap on sweeps; the solve usually exits earlier once `tol` is met. */
@@ -99,6 +112,7 @@ export function optimalOmega(nx: number, ny: number = nx): number {
 
 export const defaultParams: SimulationParams = {
   cflTarget: 2.0, // initially it was 1. Bridson's book mentions 5.
+  scheme: 'semiLagrangian',
   dtMax: 1 / 30,
   pressureIters: 100,
   tol: 5e-3, // strict headless-reference default; the browser passes looser (see main.ts)
@@ -129,6 +143,11 @@ export class Simulation {
   private uNext: FieldArray;
   private vNext: FieldArray;
   private dyeNext: FieldArray[];
+  // MacCormack's forward pass, kept so the correction can compare against it.
+  // One dye buffer is enough for all channels: they are advected one at a time.
+  private uHat: FieldArray;
+  private vHat: FieldArray;
+  private dyeHat: FieldArray;
 
   /** Set by reset(), so switching scenes can't leave an emitter running. */
   private dyeSource: DyeSource | null = null;
@@ -149,6 +168,9 @@ export class Simulation {
     this.uNext = new Float64Array(this.f.u.length);
     this.vNext = new Float64Array(this.f.v.length);
     this.dyeNext = this.f.dye.map(() => new Float64Array(this.f.p.length));
+    this.uHat = new Float64Array(this.f.u.length);
+    this.vHat = new Float64Array(this.f.v.length);
+    this.dyeHat = new Float64Array(this.f.p.length);
   }
 
   /**
@@ -200,7 +222,21 @@ export class Simulation {
     const scale = (p.rho * g.h * g.h) / dt;
     const gradScale = dt / (p.rho * g.h);
 
-    advectVelocity(g, f.u, f.v, this.uNext, this.vNext, f.label, dt);
+    if (p.scheme === 'macCormack') {
+      advectVelocityMacCormack(
+        g,
+        f.u,
+        f.v,
+        this.uHat,
+        this.vHat,
+        this.uNext,
+        this.vNext,
+        f.label,
+        dt,
+      );
+    } else {
+      advectVelocity(g, f.u, f.v, this.uNext, this.vNext, f.label, dt);
+    }
     [f.u, this.uNext] = [this.uNext, f.u];
     [f.v, this.vNext] = [this.vNext, f.v];
 
@@ -220,7 +256,11 @@ export class Simulation {
     // Channels are fully independent — same velocity, no coupling — so this is
     // a plain loop rather than anything vector-valued.
     for (let c = 0; c < f.dye.length; c++) {
-      advectScalar(g, f.u, f.v, f.dye[c], this.dyeNext[c], f.label, dt);
+      if (p.scheme === 'macCormack') {
+        advectScalarMacCormack(g, f.u, f.v, f.dye[c], this.dyeHat, this.dyeNext[c], f.label, dt);
+      } else {
+        advectScalar(g, f.u, f.v, f.dye[c], this.dyeNext[c], f.label, dt);
+      }
       [f.dye[c], this.dyeNext[c]] = [this.dyeNext[c], f.dye[c]];
     }
 

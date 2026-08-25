@@ -237,6 +237,21 @@ Bridson's pseudocode.
 - **Step 4: buoyancy + advected temperature.** Unlocks the plume preset.
 - **Step 5: vorticity confinement.** Visual-quality pass — last, because
   it's a knob on an already-correct solver, not a correctness feature.
+  **Reconsider after Step 6** — it exists to replace detail that advection
+  destroyed, and Step 6 destroys much less of it.
+- **Step 6 (added, done): MacCormack advection.** The plan's original gap.
+  Two extra semi-Lagrangian passes estimate the first pass's own error and
+  subtract it, cancelling the leading _dissipative_ term; a limiter clamping
+  each result to its donor stencil keeps it unconditionally stable. Measured
+  against plain semi-Lagrangian on the same seed: cone peak after one
+  revolution 0.30 -> 0.81 at 64^2, kinetic energy kept at t=10 2% -> 9%,
+  enstrophy 0.3% -> 1.8%, for ~2.5x the advection cost (~20% of a frame,
+  since the pressure solve dominates). It sits in the same slot as FLIP
+  below — attacking the _cause_ of numerical dissipation — but is a 60-line
+  change rather than a new subsystem, which is why deferring it with FLIP
+  was the wrong call. Not conservative: the limiter clips the undershoots
+  that would balance the overshoots, so dye MASS grows a few percent per
+  revolution (0.4% without the limiter, at the price of negative dye).
 
 **Poisson solver, in this order:**
 

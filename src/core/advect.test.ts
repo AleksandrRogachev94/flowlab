@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGrid, createFields, idxP, idxU, idxV, type FieldArray } from './grid.ts';
-import { advectScalar, advectVelocity } from './advect.ts';
+import {
+  advectScalar,
+  advectScalarMacCormack,
+  advectVelocity,
+  advectVelocityMacCormack,
+} from './advect.ts';
 import { computeDivergence } from './divergence.ts';
 import { solvePressure } from './pressure.ts';
 import { subtractGradient } from './subtractGradient.ts';
@@ -420,4 +425,101 @@ test('advectScalar RK2 holds on a ramp in y too', () => {
       );
     }
   }
+});
+
+// --- MacCormack ------------------------------------------------------------
+
+test('MacCormack leaves a uniform velocity field alone', () => {
+  const g = createGrid(6, 6, H);
+  const f = createFields(g, Float64Array);
+  const U = 0.75;
+  const V = -0.25;
+  f.u.fill(U);
+  f.v.fill(V);
+  const hat = outputs(g);
+  const { uOut, vOut } = outputs(g);
+
+  advectVelocityMacCormack(g, f.u, f.v, hat.uOut, hat.vOut, uOut, vOut, f.label, 0.3 * H);
+
+  // The round trip is exact on a constant field, so the correction term is
+  // identically zero — anything else means the reverse pass has the wrong
+  // sign or is carried by the wrong velocity.
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 1; i < g.nx; i++) {
+      assert.ok(Math.abs(uOut[idxU(g, i, j)] - U) < 1e-12, `uOut(${i},${j})`);
+    }
+  }
+  for (let j = 1; j < g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) {
+      assert.ok(Math.abs(vOut[idxV(g, i, j)] - V) < 1e-12, `vOut(${i},${j})`);
+    }
+  }
+});
+
+test('the limiter keeps MacCormack inside the input range at a huge dt', () => {
+  const g = createGrid(8, 8, H);
+  const f = createFields(g, Float64Array);
+  for (let j = 0; j < g.ny; j++) {
+    for (let i = 0; i <= g.nx; i++) f.u[idxU(g, i, j)] = Math.sin(i * 1.7) * Math.cos(j * 2.3);
+  }
+  for (let j = 0; j <= g.ny; j++) {
+    for (let i = 0; i < g.nx; i++) f.v[idxV(g, i, j)] = Math.cos(i * 1.1) * Math.sin(j * 0.9);
+  }
+  const uMax = Math.max(...f.u.map(Math.abs));
+  const vMax = Math.max(...f.v.map(Math.abs));
+  const hat = outputs(g);
+  const { uOut, vOut } = outputs(g);
+
+  // Plain semi-Lagrangian gets this for free (its output IS a blend of
+  // inputs). MacCormack's correction is what could overshoot, so this test
+  // fails the moment clampToStencil* is dropped.
+  advectVelocityMacCormack(g, f.u, f.v, hat.uOut, hat.vOut, uOut, vOut, f.label, 50 * H);
+
+  for (let k = 0; k < uOut.length; k++) {
+    assert.ok(Number.isFinite(uOut[k]) && Math.abs(uOut[k]) <= uMax + 1e-12, `uOut[${k}]`);
+  }
+  for (let k = 0; k < vOut.length; k++) {
+    assert.ok(Number.isFinite(vOut[k]) && Math.abs(vOut[k]) <= vMax + 1e-12, `vOut[${k}]`);
+  }
+});
+
+/**
+ * The claim the whole scheme exists for, as a number. A Gaussian blob carried
+ * by a uniform velocity should translate with its shape intact; every step of
+ * bilinear interpolation shaves the peak instead. Same field, same steps, same
+ * dt — only the scheme differs.
+ */
+test('MacCormack keeps a scalar peak that semi-Lagrangian smears away', () => {
+  const g = createGrid(64, 16, H);
+  const f = createFields(g, Float64Array);
+  f.u.fill(1.0);
+  const sigma = 4 * H;
+  const seed = (q: FieldArray): void => {
+    for (let j = 0; j < g.ny; j++) {
+      for (let i = 0; i < g.nx; i++) {
+        const dx = (i + 0.5) * H - 8 * H;
+        const dy = (j + 0.5) * H - 8 * H;
+        q[idxP(g, i, j)] = Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma));
+      }
+    }
+  };
+
+  const dt = 0.5 * H;
+  const run = (mac: boolean): number => {
+    let a: FieldArray = new Float64Array(g.nx * g.ny);
+    let b: FieldArray = new Float64Array(g.nx * g.ny);
+    const hat = new Float64Array(g.nx * g.ny);
+    seed(a);
+    for (let n = 0; n < 40; n++) {
+      if (mac) advectScalarMacCormack(g, f.u, f.v, a, hat, b, f.label, dt);
+      else advectScalar(g, f.u, f.v, a, b, f.label, dt);
+      [a, b] = [b, a];
+    }
+    return Math.max(...a);
+  };
+
+  const sl = run(false);
+  const mc = run(true);
+  assert.ok(mc > sl + 0.05, `MacCormack peak ${mc} not clearly above semi-Lagrangian ${sl}`);
+  assert.ok(mc <= 1 + 1e-12, `MacCormack overshot the initial maximum: ${mc}`);
 });

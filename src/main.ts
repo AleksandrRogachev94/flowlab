@@ -1,8 +1,15 @@
-import { Simulation, type DyeSeed, type SceneSpec } from './core/simulation.ts';
+import { Simulation, type DyeSeed, type DyeSource, type SceneSpec } from './core/simulation.ts';
 import { karmanChannel } from './scenes/karman.ts';
 import { wallJet } from './scenes/emitters.ts';
 import { openRight } from './scenes/obstacles.ts';
-import { addDyeMono, addDyeTriad, addVortexCluster, addVortexPair } from './scenes/testFields.ts';
+import {
+  addDyeMono,
+  addDyeStripes,
+  addDyeTriad,
+  addVortexCluster,
+  addVortexPair,
+  stripeInflow,
+} from './scenes/testFields.ts';
 import { FieldView, VIEWS } from './viz/fieldView.ts';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#view')!;
@@ -21,8 +28,8 @@ const readout = document.querySelector<HTMLPreElement>('#readout')!;
  * 320x180 is roughly the real-time ceiling on the CPU; going higher is a
  * solver problem (PLAN.md's CG step, then WebGPU), not a tuning one.
  */
-const NX = 480;
-const NY = 270;
+const NX = 320;
+const NY = 180;
 
 /**
  * A FIXED sweep budget, not a convergence tolerance — the real-time half of
@@ -44,10 +51,14 @@ const NY = 270;
  * sweep in every twelve.
  *
  * Scaled with the grid because SOR needs O(N) sweeps for a fixed error
- * reduction, so any constant is tuned to one resolution — measured demand ran
- * 0.10-0.15 * N across 240x135, 320x180 and 480x270. 0.15 * N sits at the top
- * of that, well above the floor where under-solving compounds (a flat 10
- * sweeps diverged to NaN at 240x135).
+ * reduction, so any constant is tuned to one resolution. Well above the floor
+ * where under-solving compounds (a flat 10 sweeps diverged to NaN at 240x135).
+ *
+ * Re-measured under MacCormack, since it hands the solver a sharper u* and
+ * does raise demand by ~a third (median 144 vs 108 sweeps at 240x135). The
+ * physics is unmoved, which is what actually decides this: St 0.2045 / 0.2053 /
+ * 0.2055 and wake amplitude 0.675 / 0.680 / 0.683 at 36 / 72 / 150 sweeps —
+ * 0.5% across a 4x range, for 2.1x the frame time. The budget stays.
  */
 const PRESSURE_ITERS = Math.round(0.15 * Math.max(NX, NY));
 const PRESSURE_TOL = 0;
@@ -69,12 +80,15 @@ interface SceneDef {
   /** Scene injects its own dye, so entering it defaults the tracer to 'none'
    *  rather than layering a preset underneath. Pressing T still overrides. */
   ownDye?: boolean;
+  /** The whole left edge is inflow, so a tracer can be topped up there — see
+   *  stripeInflow. False for wallJet, whose left edge is mostly wall. */
+  inflow?: boolean;
   decay?: number;
   build: () => SceneSpec;
 }
 
 const SCENES: SceneDef[] = [
-  { name: 'karman', ownDye: true, build: () => karmanChannel(sim.g) },
+  { name: 'karman', ownDye: true, inflow: true, build: () => karmanChannel(sim.g) },
   { name: 'dipole', build: () => ({ seed: addVortexPair }) },
   { name: 'cluster', build: () => ({ seed: addVortexCluster }) },
   {
@@ -98,15 +112,44 @@ const SCENES: SceneDef[] = [
  *         show up as colours that were never seeded.
  * 'mono'  one white disk. The control: same advection, no mixing signal, so
  *         it isolates how much of the picture the colour is really carrying.
+ * 'stripes' many thin horizontal bands. Fat bands show where fluid CAME FROM;
+ *         thin ones show how much it has been STRETCHED, since every band edge
+ *         is a material line and the local spacing is the strain field.
  * 'none'  empty, for scenes that inject their own dye.
  */
-const TRACERS: { name: string; seed?: DyeSeed }[] = [
+interface Tracer {
+  name: string;
+  /** Written once, at reset. */
+  seed?: DyeSeed;
+  /** Re-stamped every step, so the tracer keeps arriving instead of washing
+   *  out through an outlet. Only meaningful where the whole left edge is
+   *  inflow — see SceneDef.inflow and stripeInflow. */
+  source?: DyeSource;
+}
+
+const TRACERS: Tracer[] = [
   { name: 'triad', seed: addDyeTriad },
   { name: 'mono', seed: addDyeMono },
+  { name: 'stripes', seed: addDyeStripes, source: stripeInflow() },
   { name: 'none' },
 ];
 
-const sim = new Simulation(NX, NY, { pressureIters: PRESSURE_ITERS, tol: PRESSURE_TOL });
+/**
+ * MacCormack by default: on the same seed it keeps ~4x the kinetic energy and
+ * ~6x the enstrophy of plain semi-Lagrangian at t = 10, and a dye peak of 0.95
+ * against 0.56 (128x128 cluster). 'A' flips it live — the schemes share all
+ * state, so the switch shows up immediately in how fast filaments blur.
+ *
+ * It is NOT free here: 130 -> 191 ms/step on karman at this grid, because the
+ * fixed 72-sweep budget leaves advection a real share of the frame. Worth it
+ * for the picture; if the target is frame rate rather than detail, dropping to
+ * 320x180 with MacCormack beats 480x270 without it.
+ */
+const sim = new Simulation(NX, NY, {
+  scheme: 'macCormack',
+  pressureIters: PRESSURE_ITERS,
+  tol: PRESSURE_TOL,
+});
 const fieldView = new FieldView(sim.g);
 
 const TRACER_NONE = TRACERS.findIndex((t) => t.name === 'none');
@@ -133,6 +176,24 @@ function fitCanvas(): void {
   canvas.height = Math.round(h * dpr);
 }
 
+/**
+ * Which source keeps stamping dye, the scene's or the tracer's. The one place
+ * the two can disagree, so it is worth a table rather than a nested ternary:
+ *
+ *   tracer 'none'          -> the scene's own source (karman's RGB inlet bands)
+ *   tracer + inflow scene  -> the tracer's source, if it has one
+ *   tracer, no inflow      -> none; the tracer is seeded once and left to run
+ *
+ * An explicit tracer OWNS the dye: karman stamps its RGB bands every step, and
+ * left running it composites a second, different tracer on top of the chosen
+ * one. And only a full-width inflow can top a tracer up — stripeInflow would
+ * otherwise pin dye against a stagnant wall.
+ */
+function dyeSourceFor(def: SceneDef, spec: SceneSpec, tracer: Tracer): DyeSource | undefined {
+  if (!tracer.seed) return spec.dyeSource;
+  return def.inflow ? tracer.source : undefined;
+}
+
 function restart(): void {
   const def = SCENES[sceneIndex];
   const spec = def.build();
@@ -140,7 +201,11 @@ function restart(): void {
   // The selected tracer always applies, so the readout can never claim one the
   // sim is not running; `?? spec.dye` keeps a scene's own seed when it is
   // 'none'. `ownDye` only picks the DEFAULT on entry, in nextScene.
-  sim.reset({ ...spec, dye: TRACERS[tracerIndex].seed ?? spec.dye });
+  const tracer = TRACERS[tracerIndex];
+  sim.reset({ ...spec, dye: tracer.seed ?? spec.dye, dyeSource: dyeSourceFor(def, spec, tracer) });
+}
+function toggleScheme(): void {
+  sim.params.scheme = sim.params.scheme === 'macCormack' ? 'semiLagrangian' : 'macCormack';
 }
 function toggleView(): void {
   viewIndex = (viewIndex + 1) % VIEWS.length;
@@ -163,12 +228,14 @@ onClick('restart', restart);
 onClick('toggleView', toggleView);
 onClick('nextScene', nextScene);
 onClick('nextTracer', nextTracer);
+onClick('toggleScheme', toggleScheme);
 
 window.addEventListener('keydown', (e) => {
   if (e.key === 'r' || e.key === 'R') restart();
   if (e.key === 'd' || e.key === 'D') toggleView();
   if (e.key === 's' || e.key === 'S') nextScene();
   if (e.key === 't' || e.key === 'T') nextTracer();
+  if (e.key === 'a' || e.key === 'A') toggleScheme();
 });
 window.addEventListener('resize', fitCanvas);
 
@@ -177,15 +244,16 @@ restart();
 
 function frame(): void {
   sim.step();
-  const { maxSpeed, divMax } = fieldView.draw(ctx, sim, VIEWS[viewIndex]);
+  const { maxSpeed, divMax, divRms } = fieldView.draw(ctx, sim, VIEWS[viewIndex]);
 
   readout.textContent =
     `scene ${SCENES[sceneIndex].name} (S)   view ${VIEWS[viewIndex]} (D)   ` +
-    `dye ${TRACERS[tracerIndex].name} (T)   grid ${sim.g.nx}x${sim.g.ny}\n` +
+    `dye ${TRACERS[tracerIndex].name} (T)   advect ${sim.params.scheme} (A)   ` +
+    `grid ${sim.g.nx}x${sim.g.ny}\n` +
     `t ${sim.time.toFixed(2)}   max speed ${maxSpeed.toFixed(3)}   ` +
     `dt ${sim.dt.toExponential(2)} (CFL ${sim.cfl.toFixed(2)})   ` +
     `SOR ${sim.iters} sweeps   ` +
-    `div residual ±${divMax.toExponential(1)}`;
+    `div rms ${(100 * divRms).toFixed(3)}% of u/h (worst cell ±${divMax.toExponential(1)})`;
 
   requestAnimationFrame(frame);
 }

@@ -77,20 +77,27 @@ export function karmanChannel(g: Grid, options: Partial<KarmanOptions> = {}): Sc
    * other, so alternating vortices read as alternating colour instead of a grey
    * blur.
    *
-   * Slightly WIDER than the cylinder (1.25D) on purpose, not by accident: the
-   * body has to split the band, sending the top colour over and the bottom
-   * colour under, or every vortex gets the same mixture and the alternation
-   * disappears. Much wider than this and the outer bands sail past the wake
-   * without ever entering it.
+   * The band edges line up with the BODY, not with equal thirds. The middle
+   * band is exactly one diameter wide, so it is precisely the stream tube the
+   * cylinder splits — the fluid that becomes both shear layers and both
+   * families of vortex cores. The outer bands are half a diameter each and
+   * carry fluid that passes above or below without ever touching it. Under
+   * equal thirds every colour was a MIXTURE of the two populations, which is
+   * what made the middle band read as merely "thin".
+   *
+   * It stays thin either way, and that is physics, not a defect: the flux
+   * between two streamlines is conserved, so a material band's width goes as
+   * 1/speed. The stagnation tube necessarily narrows as it accelerates around
+   * the shoulder, then gets wound into the cores. Total span is 2D — much
+   * wider and the outer bands sail past the wake without entering it.
    */
-  const span = 1.25 * diameter;
-  const y0 = cy - 0.5 * span;
   const dyeSource: DyeSource = (gg, dye) => {
     const depth = Math.min(depthCells, gg.nx);
     for (let j = 0; j < gg.ny; j++) {
-      const t = ((j + 0.5) * gg.h - y0) / span;
-      if (t < 0 || t >= 1) continue;
-      const band = Math.floor(t * dye.length);
+      const d = (j + 0.5) * gg.h - cy;
+      if (Math.abs(d) >= diameter) continue;
+      // Below / the body's own tube / above. Assumes the three RGB channels.
+      const band = Math.abs(d) < 0.5 * diameter ? 1 : d < 0 ? 0 : 2;
       for (let i = 0; i < depth; i++) {
         const k = idxP(gg, i, j);
         for (let c = 0; c < dye.length; c++) dye[c][k] = c === band ? 1 : 0;

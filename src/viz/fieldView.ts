@@ -22,7 +22,16 @@ export type View = (typeof VIEWS)[number];
  *  only these numbers show decay and convergence. */
 export interface ViewStats {
   maxSpeed: number;
+  /** Worst single fluid cell. Reported, but NOT the headline: the extremes sit
+   *  on the obstacle's staircase corners at ~1000x the median, so this number
+   *  tracks the geometry rather than the state of the solve. */
   divMax: number;
+  /**
+   * RMS |div| over fluid cells, as a fraction of maxSpeed/h — the largest
+   * divergence one cell could carry. Dimensionless, so it is comparable across
+   * resolutions and flow speeds, where the raw max is not.
+   */
+  divRms: number;
 }
 
 /** Renders a Simulation as a heatmap plus arrows. Owns its scratch buffers,
@@ -43,6 +52,8 @@ export class FieldView {
 
     let maxSpeed = 0;
     let divMax = 0;
+    let divSq = 0;
+    let fluidCells = 0;
     for (let j = 0; j < g.ny; j++) {
       for (let i = 0; i < g.nx; i++) {
         const k = idxP(g, i, j);
@@ -56,8 +67,12 @@ export class FieldView {
         if (s > maxSpeed) maxSpeed = s;
         const d = Math.abs(div[k]);
         if (d > divMax) divMax = d;
+        divSq += d * d;
+        fluidCells++;
       }
     }
+
+    const divRms = fluidCells ? Math.sqrt(divSq / fluidCells) / ((maxSpeed || 1) / g.h) : 0;
 
     if (view === 'vorticity') {
       computeVorticity(g, f.u, f.v, this.vort);
@@ -91,8 +106,14 @@ export class FieldView {
     } else {
       // coolwarm keeps its near-white zero here: the debug question is "is
       // anything nonzero", and specks of colour read fastest against white.
+      //
+      // p99, for the same reason as vorticity above and with the same cause:
+      // |div| spans ~1000x between its median and its max, and the max lives on
+      // the cylinder's staircase corners. Scaling to it painted every other cell
+      // at the ramp's neutral midpoint, i.e. a blank frame with three specks —
+      // hiding exactly the interior residual this view exists to show.
       this.heatmap.draw(div, ctx, {
-        normalization: { kind: 'fixed', min: -divMax, max: divMax },
+        normalization: { kind: 'percentile', p: 0.99 },
         colormap: coolwarm,
       });
     }
@@ -115,7 +136,7 @@ export class FieldView {
       refSpeed: maxSpeed,
     });
 
-    return { maxSpeed, divMax };
+    return { maxSpeed, divMax, divRms };
   }
 
   /**
