@@ -87,3 +87,38 @@ test('applyOutflow is a no-op on a closed box', () => {
   assert.deepEqual([...f.u], [...u0]);
   assert.deepEqual([...f.v], [...v0]);
 });
+
+test('applyOutflow refuses backflow through an outlet, and only backflow', () => {
+  // The energy argument in applyOutflow's header: with p = 0 on the outlet,
+  // the boundary term of dE/dt is -∮ ½|u|²(u·n), which is a SOURCE wherever
+  // the flow reverses. Clamping the normal component is what fixes its sign.
+  const f = createFields(g, Float64Array);
+  for (let j = 0; j < g.ny; j++) f.label[idxP(g, g.nx - 1, j)] = Cell.Air;
+  // Row 0 leaves, row 1 reverses — one call has to treat them differently.
+  f.u[idxU(g, g.nx - 1, 0)] = 2;
+  f.u[idxU(g, g.nx - 1, 1)] = -2;
+
+  applyOutflow(g, f.u, f.v, f.label);
+
+  assert.equal(f.u[idxU(g, g.nx - 1, 0)], 2, 'outgoing flow must pass through untouched');
+  assert.equal(f.u[idxU(g, g.nx, 0)], 2, 'and be extrapolated onto the ghost face');
+  assert.equal(f.u[idxU(g, g.nx - 1, 1)], 0, 'inflow through the outlet must be clamped away');
+  assert.equal(f.u[idxU(g, g.nx, 1)], 0, 'the ghost face may never disagree with the outlet');
+});
+
+test('applyOutflow clamps toward each edge OWN outward normal', () => {
+  // A low-edge outlet leaves in -x, so there the sign convention flips and
+  // POSITIVE u is the backflow. Getting this wrong turns the clamp into a
+  // wall that blocks the outlet entirely.
+  const f = createFields(g, Float64Array);
+  for (let j = 0; j < g.ny; j++) f.label[idxP(g, 0, j)] = Cell.Air;
+  f.u[idxU(g, 1, 0)] = -2; // leaving through the left edge
+  f.u[idxU(g, 1, 1)] = 2; // entering through it
+
+  applyOutflow(g, f.u, f.v, f.label);
+
+  assert.equal(f.u[idxU(g, 1, 0)], -2, 'outgoing flow must pass through untouched');
+  assert.equal(f.u[idxU(g, 0, 0)], -2);
+  assert.equal(f.u[idxU(g, 1, 1)], 0, 'inflow through a left-edge outlet must be clamped');
+  assert.equal(f.u[idxU(g, 0, 1)], 0);
+});

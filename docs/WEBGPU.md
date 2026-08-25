@@ -1,9 +1,10 @@
 # The WebGPU port
 
-Two pieces of the step run on the device: the **pressure solve** (§1-§5) and
-**advection and dye** (§8). Everything else is still CPU. This document covers
-why those pieces were chosen, how they are put together, and the one thing
-that went wrong.
+Two pieces of the step run on the device: the **pressure solve** (§1-§5, now
+multigrid — §9) and **advection and dye** (§8). Everything else is still CPU.
+This document covers why those pieces were chosen, how they are put together,
+and the two things that went wrong: the ω trap (§4) and the outlet backflow
+instability that the higher resolution exposed (§10).
 
 ---
 
@@ -298,7 +299,7 @@ tuning problem.
 2. **Keep the fields resident.** Three round trips per frame is two more than
    necessary; see the end of §8 for what has to move first.
 3. **CPU conjugate gradient**, as the converged reference (PLAN.md §8).
-4. **Multigrid**, CPU first, then the two extra shaders.
+4. ~~**Multigrid**, CPU first, then the two extra shaders.~~ Done — §9.
 
 ---
 
@@ -414,3 +415,159 @@ because the MAC grid has three different extents — `(nx+1)*ny`, `nx*(ny+1)`,
 swapped stride produces a picture that still flows, just half a cell wrong.
 `npm run test:gpu` runs it, serialised: two GPU test files cannot share the
 harness's fixed debug port.
+
+---
+
+## 9. Step 3: multigrid
+
+Built exactly on the ladder §6 prescribed: `core/pressureMultigrid.ts` is the
+f64 CPU V-cycle, `gpu/multigrid.wgsl` + `gpu/multigridGpu.ts` its device twin,
+and `multigrid.gputest.ts` pins the two against each other (2.2e-7 max diff on
+real hardware). The smoother is not new code in either place: the correction
+equation `count·e − Σe = b` is the existing red-black kernel called with
+`scale = −1`, so the sweep that §5's gputest verified is the sweep multigrid
+runs. Writing the RHS in h²-scaled "code units" makes both transfers h-free —
+restriction is the plain SUM of the four child residuals, prolongation is
+bilinear (9/16, 3/16, 3/16, 1/16). V(2,2), ω = 1 (§4: a smoother, not a
+solver), 8 sweep pairs on the ≤4-wide coarsest level, three cycles per solve,
+fixed for the same frame-pacing reason as the SOR budget.
+
+### What the O(1) claim measured out to
+
+Two regimes, and the split is the honest headline (`pressureMultigrid.test.ts`
+asserts both):
+
+- **Interior: 0.02–0.08 per cycle, grid-independent** from 32² to 1024×768.
+  The textbook number; transfers and smoother are right.
+- **Irregular boundaries: ~0.5 per cycle.** With an Air outlet column and a
+  cylinder, the stalled residual concentrates in bands around both. This is
+  the known first-order limit of re-discretized coarse operators: coarsening
+  labels moves the effective boundary by O(h_coarse) per level, so deep levels
+  correct near-boundary error against a boundary that is geometrically
+  somewhere else.
+
+§6 predicted the bugs would be in label coarsening, and that was the week's
+real lesson, with a divergence to show for it: coarse cells are Air if ANY
+child is Air, else Fluid if any child is Fluid. The tempting opposite (Fluid
+wins, so fluid cells never lose coarse coverage) removes every Air cell from
+the coarse levels — the residual equation there turns pure-Neumann with an
+inconsistent RHS, and the cycle **diverges at 280×/cycle**. Losing coverage
+costs a rate; losing the Dirichlet anchor costs everything. Two standard
+mitigations were probed and rejected: weighting the Air neighbour's diagonal
+term by its true geometric distance (0.54 → 0.45, not worth a coefficient
+field) and extra smoothing in a boundary band à la McAdams (no help — the
+broken region widens with depth, a fixed band does not reach it). The real
+fixes are Galerkin / face-fraction coarse operators or wrapping the cycle in
+PCG; parked until the rate matters.
+
+### Why 0.5 does not matter in the frame loop
+
+It bites on a white-noise RHS; a projected velocity field never hands the
+solver one. Karman at 512×384, 200 steps, CPU, post-projection divergence RMS:
+
+| solver               | ms/step | mean residual | max    |
+| -------------------- | ------- | ------------- | ------ |
+| cpu-rbsor, 77 sweeps | 295     | 1.4e-1        | 4.1e-1 |
+| cpu-mg, 2 cycles     | 178     | 7.8e-4        | 2.3e-3 |
+| cpu-mg, 3 cycles     | 189     | 1.5e-4        | 5.1e-4 |
+| cpu-mg, 4 cycles     | 207     | 3.8e-5        | 1.4e-4 |
+
+Three cycles beat the sweep budget they replace by ~900× on residual while
+costing less, cold start included (first frame: 4.8e-1 against SOR's 3.3e0).
+On the device at 1024×768 (`multigrid.gputest.ts`, wall time around one
+solve): **20.6 ms for 3 cycles against 41.3 ms for the 154-sweep budget** —
+and per §6's arithmetic the gap widens as the square of the resolution, since
+the cycle count stays 3 while the sweep budget scales with N. The G cycle now
+runs all five solvers — cpu-sor, cpu-rbsor, cpu-mg, gpu-rbsor, gpu-mg — one
+variable changing per step, with gpu-mg the default.
+
+The remaining cost at 1024×768 is §8's story again: the upload/readback round
+trip now rivals the solve itself. Item 2 of §7 — resident fields — is where
+the next factor lives.
+
+---
+
+## 10. The outlet backflow instability
+
+Not a GPU bug and not a solver bug, but it surfaced during this work and the
+diagnosis is worth keeping.
+
+**Symptom.** At 1024x768, karman ran fine for a few seconds and then grew a
+flow coming IN through the right-hand outlet — dye flooding back upstream,
+`max speed` climbing to 17x the free stream.
+
+**Mechanism.** `openRight()` makes the last column Air, which is a Dirichlet
+`p = 0`. So `subtractGradient` leaves the outlet face at
+
+    u_outlet = u* + gradScale * p_fluid
+
+and a vortex core is a pressure MINIMUM. When one drifts into the exit,
+`p_fluid` goes negative enough to reverse the face. That reversal is an energy
+source, not just an artefact: the kinetic-energy budget carries
+
+    dE/dt = -∮ (½|u|² + p)(u·n) dS
+
+which at `p = 0` is `-∮ ½|u|²(u·n)`. While the flow leaves, it drains energy,
+as an outlet should. The moment any part of the boundary reverses it flips
+sign — and nothing bounds it, because the zero-gradient rule hands the
+incoming stream the interior's own values back. The loop compounds.
+
+**Why it only appeared now.** Two things changed with the GPU port, and both
+push more energy into the exit. Resolution went `320x180 -> 640x480 ->
+1024x768`: there is no viscosity term, so effective Re is set by how much
+semi-Lagrangian dissipation smears the wake (karman.ts says so), and finer
+grids deliver tighter, deeper cores to the outlet. The aspect also went 16:9
+to 4:3 at 640x480, cutting the downstream run so vortices arrive younger.
+Multigrid did not cause it. Measured on the CPU in f64, min `u` on the outlet
+faces (negative = inflow):
+
+| grid, to t=4 | rbsor, fixed budget | mg, 3 cycles       |
+| ------------ | ------------------- | ------------------ |
+| 256x192      | never reverses      | never reverses     |
+| 512x384      | **-0.36**, growing  | **-0.39**, growing |
+
+Both solvers, same time, same magnitude. The under-solved SOR budget was only
+ever masking it — a residual of 1e-1 smears exactly the pressure spikes that
+trigger the reversal — so a solver that actually converges removed the
+accidental regulariser.
+
+**Fix.** A no-backflow clamp in `applyOutflow`: the outlet's NORMAL component
+is clamped to its own outward direction before being extrapolated onto the
+ghost face. That is all it takes to fix the sign of the boundary integral, and
+it is the standard backflow stabilisation. It costs a little divergence in the
+one cell layer behind the outlet — the clamp runs after the projection — which
+the next step's solve removes.
+
+It is not the reflecting outlet `openRight()` warns about: a prescribed
+outflow profile pins every face every step, while this leaves the exit free
+whenever flow is actually leaving and only refuses the reversal. Measured at
+256x192 over t = 8, where the baseline was still healthy:
+
+|        | St     | period | wake amp | max speed | residual | min outlet u |
+| ------ | ------ | ------ | -------- | --------- | -------- | ------------ |
+| before | 0.2024 | 0.5434 | 0.9428   | 1.707     | 7.75e-4  | -0.019       |
+| after  | 0.2024 | 0.5434 | 0.9428   | 1.707     | 8.16e-4  | 0.000        |
+
+Identical shedding frequency, period, wake amplitude and peak speed; the whole
+cost is 5% on the residual. Below the reversal threshold the two runs agree
+step for step, which is the property that makes the clamp safe to leave on.
+
+At 512x384, where the baseline does reverse, the same comparison run for run:
+
+| t   | min outlet u, before | after     | max speed, before / after |
+| --- | -------------------- | --------- | ------------------------- |
+| 2.0 | 0.390                | 0.390     | 1.908 / 1.908             |
+| 3.0 | -0.031               | **0.073** | 1.797 / 1.788             |
+| 3.5 | -0.234               | **0.000** | 1.836 / 1.843             |
+| 4.0 | -0.387               | **0.000** | 1.810 / 1.763             |
+
+Identical until the first reversal, flat at zero afterwards, and peak speed
+slightly LOWER at t = 4 — which is the energy argument showing up directly in
+the numbers.
+
+Three regression tests cover it, and all three fail on the unfixed code: two
+in `boundaries.test.ts` for the per-face rule (including the sign flip on a
+low edge, where positive u is the backflow), and one in `simulation.test.ts`
+asserting the invariant through `step()` — because the ORDER is half the
+contract. The clamp has to run after the projection, which is what creates the
+reversal in the first place.

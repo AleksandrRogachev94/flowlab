@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { optimalOmega, Simulation } from './simulation.ts';
+import { idxU } from './grid.ts';
+import { openRight } from '../scenes/obstacles.ts';
 import { addVortexCluster, addVortexPair } from '../scenes/testFields.ts';
 
 test('a long run stays finite and keeps removing divergence', async () => {
@@ -15,6 +17,25 @@ test('a long run stays finite and keeps removing divergence', async () => {
   for (const d of sim.div) worst = Math.max(worst, Math.abs(d));
   assert.ok(worst < 1e-2, `residual after 200 steps = ${worst}`);
   assert.ok(sim.time > 0, 'clock did not advance');
+});
+
+test('step() never leaves inflow on an outlet face', async () => {
+  // The invariant applyOutflow's clamp exists to hold — see docs/WEBGPU.md
+  // §10. Asserted through step() rather than on applyOutflow directly because
+  // the ORDER is half the contract: the clamp has to run after the projection,
+  // which is what creates the reversal. Seeded flowing backwards INTO the
+  // outlet so the clamp is actually exercised on the first step; the unit
+  // tests in boundaries.test.ts pin the per-face rule.
+  const sim = new Simulation(32, 24, { pressureIters: 60 });
+  sim.reset({ labels: openRight(), seed: (_g, u) => u.fill(-1) });
+
+  for (let n = 0; n < 5; n++) {
+    await sim.step();
+    for (let j = 0; j < sim.g.ny; j++) {
+      const outlet = sim.f.u[idxU(sim.g, sim.g.nx - 1, j)];
+      assert.ok(outlet >= 0, `step ${n}: outlet row ${j} took fluid in at u = ${outlet}`);
+    }
+  }
 });
 
 test('dt respects the CFL target and the dtMax cap', async () => {

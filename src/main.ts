@@ -1,4 +1,5 @@
 import { CpuAdvector } from './core/advector.ts';
+import { CpuMultigridSolver } from './core/pressureMultigrid.ts';
 import {
   cpuPressureSolver,
   cpuRedBlackSolver,
@@ -8,6 +9,7 @@ import { Profiler } from './core/profiler.ts';
 import { Simulation, type DyeSeed, type DyeSource, type SceneSpec } from './core/simulation.ts';
 import { describeGpu, initGpu } from './gpu/device.ts';
 import { GpuAdvector } from './gpu/advectGpu.ts';
+import { GpuMultigridSolver } from './gpu/multigridGpu.ts';
 import { GpuPressureSolver } from './gpu/pressureGpu.ts';
 import { karmanChannel } from './scenes/karman.ts';
 import { wallJet } from './scenes/emitters.ts';
@@ -50,8 +52,8 @@ const readout = document.querySelector<HTMLPreElement>('#readout')!;
  * again. The next resolution step is therefore a better SOLVER, not another
  * shader — see docs/WEBGPU.md §6.
  */
-const NX = 1024;
-const NY = 768;
+const NX = 1920;
+const NY = 1080;
 
 /**
  * A FIXED sweep budget, not a convergence tolerance — the real-time half of
@@ -203,26 +205,28 @@ const fieldView = new FieldView(sim.g);
 const overlay = new PerfOverlay(stage);
 
 /**
- * G cycles all three, and the ORDER is the point. Going CPU-lexicographic ->
- * CPU-red-black -> GPU-red-black changes exactly one variable at each step:
- * first the sweep ordering, then the hardware and the precision together. When
- * the GPU picture looks wrong, that middle entry is what says whether the
- * algorithm or the WGSL is at fault. See docs/WEBGPU.md §1.
+ * G cycles all of these, and the ORDER is the point: each step changes one
+ * variable. CPU-lexicographic -> CPU-red-black is the sweep ordering;
+ * -> CPU-multigrid is the algorithm; each CPU rung then has its GPU twin
+ * (hardware + precision together). When a GPU picture looks wrong, the CPU
+ * rung with the same algorithm says whether the algorithm or the WGSL is at
+ * fault. See docs/WEBGPU.md §1 and §9.
  *
- * The GPU entry appends itself when the device is ready, and the sim switches
- * to it then. Not awaited at startup: the first frame should not wait on a
- * driver, and there is a correct thing to run in the meantime.
+ * The GPU entries append themselves when the device is ready, and the sim
+ * switches to gpu-mg then — it is the fastest AND best-converged solver here
+ * (docs/WEBGPU.md §9). Not awaited at startup: the first frame should not
+ * wait on a driver, and there is a correct thing to run in the meantime.
  */
-const SOLVERS: PressureSolver[] = [cpuPressureSolver, cpuRedBlackSolver];
-let gpuSolver: GpuPressureSolver | null = null;
+const SOLVERS: PressureSolver[] = [cpuPressureSolver, cpuRedBlackSolver, new CpuMultigridSolver()];
+let gpuSolvers: (GpuPressureSolver | GpuMultigridSolver)[] = [];
 let gpuName = '';
 
 void initGpu().then((ctx) => {
   if (!ctx) return;
-  gpuSolver = new GpuPressureSolver(ctx, sim.g);
+  gpuSolvers = [new GpuPressureSolver(ctx, sim.g), new GpuMultigridSolver(ctx, sim.g)];
   gpuName = describeGpu(ctx);
-  SOLVERS.push(gpuSolver);
-  sim.solver = gpuSolver;
+  SOLVERS.push(...gpuSolvers);
+  sim.solver = gpuSolvers[1];
   // Not on the G cycle: G exists to compare pressure SOLVERS, and swapping
   // advection underneath it would stop that being one variable at a time.
   // Advection has no algorithmic choice to make here — the GPU kernel is the
@@ -231,16 +235,16 @@ void initGpu().then((ctx) => {
 });
 
 /**
- * Drops the GPU solver on any device-side failure, once. A GPU error is
+ * Drops the GPU solvers on any device-side failure, once. A GPU error is
  * usually permanent (a lost device, an out-of-memory), so retrying it every
- * frame turns one console line into thousands. It is always last in SOLVERS,
- * so popping it also stops G cycling back onto it.
+ * frame turns one console line into thousands. They are always last in
+ * SOLVERS, so truncating also stops G cycling back onto them.
  */
 function dropGpu(why: string): void {
-  if (!gpuSolver) return;
+  if (gpuSolvers.length === 0) return;
   console.error(`[gpu] falling back to the CPU: ${why}`);
-  SOLVERS.pop();
-  gpuSolver = null;
+  SOLVERS.length -= gpuSolvers.length;
+  gpuSolvers = [];
   sim.solver = cpuPressureSolver;
   sim.advector = new CpuAdvector(sim.g);
 }
@@ -376,12 +380,13 @@ async function frame(): Promise<void> {
     `solver ${sim.solver.name} (G)   perf (P)   grid ${sim.g.nx}x${sim.g.ny}\n` +
     `t ${sim.time.toFixed(2)}   max speed ${maxSpeed.toFixed(3)}   ` +
     `dt ${sim.dt.toExponential(2)} (CFL ${sim.cfl.toFixed(2)})   ` +
-    `SOR ${sim.iters} sweeps   ` +
+    // Sweeps on the SOR solvers, V-cycles on the multigrid ones.
+    `solve ${sim.iters} its   ` +
     `div rms ${(100 * divRms).toFixed(3)}% of u/h (worst cell ±${divMax.toExponential(1)})`;
 
   // Pure wiring: everything here is already measured and already smoothed by
   // whoever owns it, and the panel decides how it reads.
-  const onGpu = gpuSolver !== null && sim.solver === gpuSolver ? gpuSolver : null;
+  const onGpu = gpuSolvers.find((s) => s === sim.solver) ?? null;
   overlay.update({
     phases: sim.perf,
     totals: drawPerf,

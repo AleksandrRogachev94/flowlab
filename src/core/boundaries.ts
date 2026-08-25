@@ -64,26 +64,80 @@ export function commitLabels(g: Grid, f: Fields): void {
 }
 
 /**
- * Zero-gradient (du/dn = 0) extrapolation onto the domain-boundary face of any
- * Air cell sitting on the edge — i.e. an open outlet.
+ * The open-boundary pass. Two jobs on every edge Air cell — i.e. an outlet:
+ * a NO-BACKFLOW clamp on the outlet face, then zero-gradient (du/dn = 0)
+ * extrapolation of that value onto the outermost face.
  *
- * The pressure solve skips Air cells and never needs this; ADVECTION does.
- * That outermost face is written by neither subtractGradient (its loops stop
- * one short) nor advectVelocity (out-of-domain counts as solid), so left alone
- * it sits at its seeded value forever — a stationary wall one bilinear sample
- * away from the outlet, which every backtrace near the exit blends against.
+ * THE EXTRAPOLATION. The pressure solve skips Air cells and never needs it;
+ * ADVECTION does. The outermost face is written by neither subtractGradient
+ * (its loops stop one short) nor advectVelocity (out-of-domain counts as
+ * solid), so left alone it sits at its seeded value forever — a stationary
+ * wall one bilinear sample away from the outlet, which every backtrace near
+ * the exit blends against.
  *
- * Runs after subtractGradient, so it extrapolates the PROJECTED velocity.
- * A no-op on a closed box. Covers all four edges even though only openRight()
- * exists today — an open top (buoyant plume) and painted Air will need them.
+ * THE CLAMP, and why an outlet cannot be left to take whatever the projection
+ * gives it. p = 0 in the Air column is a Dirichlet condition, so the outlet
+ * face comes out of subtractGradient as
+ *
+ *     u_outlet = u* + gradScale * p_fluid
+ *
+ * and a vortex core is a pressure MINIMUM. When one drifts into the exit,
+ * p_fluid goes far enough negative to reverse the face: the outlet starts
+ * taking fluid IN. That is not merely untidy, it is an energy source. The
+ * kinetic-energy budget of the domain carries a boundary term
+ *
+ *     dE/dt = -∮ (½|u|² + p) (u·n) dS
+ *
+ * which for p = 0 is -∮ ½|u|² (u·n). While the flow leaves (u·n > 0) that is
+ * negative and energy drains out, as an outlet should. The instant any part of
+ * the boundary reverses it flips SIGN and pumps energy in, with nothing to
+ * limit it: the inflowing velocity is whatever the zero-gradient rule copied
+ * outward, so the boundary feeds the interior its own values back. The loop
+ * compounds — measured at 512x384 the reversal deepens monotonically
+ * (-0.03 -> -0.23 -> -0.39 over t = 3..4), and at 1024x768 it runs away to
+ * 17x the free-stream speed with dye flooding back in through the exit.
+ *
+ * Clamping the NORMAL component to the outflow direction is enough to fix the
+ * sign of that integral, and is the standard backflow stabilisation. It costs
+ * a little divergence in the one cell layer behind the outlet — the clamp
+ * happens after the projection, so the face no longer matches the p that was
+ * solved for — which the next step's solve removes. That is a real trade and
+ * the cheap side of it: the alternative is an unbounded energy source.
+ *
+ * It is NOT the reflecting outlet that openRight() warns about. A prescribed
+ * outflow profile pins every face every step; this leaves the exit free
+ * whenever the flow is actually leaving, and only refuses the reversal.
+ *
+ * Runs after subtractGradient, so it sees the PROJECTED velocity. A no-op on
+ * a closed box. Covers all four edges even though only openRight() exists
+ * today — an open top (buoyant plume) and painted Air will need them.
  */
 export function applyOutflow(g: Grid, u: FieldArray, v: FieldArray, label: Uint8Array): void {
+  // Each edge clamps toward ITS OWN outward normal, hence min on the low
+  // edges and max on the high ones. The clamped value is what gets copied
+  // outward, so the ghost face can never disagree with the outlet face.
   for (let j = 0; j < g.ny; j++) {
-    if (label[idxP(g, 0, j)] === Cell.Air) u[idxU(g, 0, j)] = u[idxU(g, 1, j)];
-    if (label[idxP(g, g.nx - 1, j)] === Cell.Air) u[idxU(g, g.nx, j)] = u[idxU(g, g.nx - 1, j)];
+    if (label[idxP(g, 0, j)] === Cell.Air) {
+      const out = Math.min(u[idxU(g, 1, j)], 0);
+      u[idxU(g, 1, j)] = out;
+      u[idxU(g, 0, j)] = out;
+    }
+    if (label[idxP(g, g.nx - 1, j)] === Cell.Air) {
+      const out = Math.max(u[idxU(g, g.nx - 1, j)], 0);
+      u[idxU(g, g.nx - 1, j)] = out;
+      u[idxU(g, g.nx, j)] = out;
+    }
   }
   for (let i = 0; i < g.nx; i++) {
-    if (label[idxP(g, i, 0)] === Cell.Air) v[idxV(g, i, 0)] = v[idxV(g, i, 1)];
-    if (label[idxP(g, i, g.ny - 1)] === Cell.Air) v[idxV(g, i, g.ny)] = v[idxV(g, i, g.ny - 1)];
+    if (label[idxP(g, i, 0)] === Cell.Air) {
+      const out = Math.min(v[idxV(g, i, 1)], 0);
+      v[idxV(g, i, 1)] = out;
+      v[idxV(g, i, 0)] = out;
+    }
+    if (label[idxP(g, i, g.ny - 1)] === Cell.Air) {
+      const out = Math.max(v[idxV(g, i, g.ny - 1)], 0);
+      v[idxV(g, i, g.ny - 1)] = out;
+      v[idxV(g, i, g.ny)] = out;
+    }
   }
 }
