@@ -87,3 +87,33 @@ button:hover {
   white-space: pre;
   overflow: hidden;
 }
+
+/* Perf overlay — floats over the canvas inside #stage, which is the
+   positioned ancestor. pointer-events: none so it never intercepts a click
+   meant for the canvas (mouse interaction lands there later).
+
+   It is a <pre>, so the columns and the text bars align with no layout rules
+   at all — see viz/perfOverlay.ts. */
+.perf {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 2;
+  pointer-events: none;
+  margin: 0;
+  font:
+    11px/1.45 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  color: var(--text);
+  background: rgba(12, 14, 19, 0.82);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  /* Tabular figures, or every repaint shifts the columns as digits change. */
+  font-variant-numeric: tabular-nums;
+}
+.perf[hidden] {
+  display: none;
+}

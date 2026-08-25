@@ -1,4 +1,12 @@
+import {
+  cpuPressureSolver,
+  cpuRedBlackSolver,
+  type PressureSolver,
+} from './core/pressureSolver.ts';
+import { Profiler } from './core/profiler.ts';
 import { Simulation, type DyeSeed, type DyeSource, type SceneSpec } from './core/simulation.ts';
+import { describeGpu, initGpu } from './gpu/device.ts';
+import { GpuPressureSolver } from './gpu/pressureGpu.ts';
 import { karmanChannel } from './scenes/karman.ts';
 import { wallJet } from './scenes/emitters.ts';
 import { openRight } from './scenes/obstacles.ts';
@@ -11,6 +19,7 @@ import {
   stripeInflow,
 } from './scenes/testFields.ts';
 import { FieldView, VIEWS } from './viz/fieldView.ts';
+import { PerfOverlay } from './viz/perfOverlay.ts';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#view')!;
 const stage = document.querySelector<HTMLDivElement>('#stage')!;
@@ -18,18 +27,30 @@ const ctx = canvas.getContext('2d')!;
 const readout = document.querySelector<HTMLPreElement>('#readout')!;
 
 /**
- * One 16:9 grid for every scene (1 unit tall, 16/9 wide). Scenes used to carry
- * their own dimensions, but resizing the window per scene was worse than a
- * shared screen-shaped domain; karman keeps its long wake with a SMALLER
- * cylinder rather than a wider box — what matters is diameters downstream.
+ * One screen-shaped grid for every scene: h = 1/ny, so the domain is always
+ * exactly one unit tall and nx/ny units wide. Scenes used to carry their own
+ * dimensions, but a shared domain beat resizing per scene; karman keeps its
+ * long wake with a SMALLER cylinder rather than a wider box — what matters is
+ * diameters downstream, and 4:3 gives it less room than 16:9 did.
  *
  * Cost grows faster than the cell count, since SOR's sweep count also scales
- * with N: a solve is ~17 ms/step at 240x135, 41 at 320x180, 136 at 480x270.
- * 320x180 is roughly the real-time ceiling on the CPU; going higher is a
- * solver problem (PLAN.md's CG step, then WebGPU), not a tuning one.
+ * with N. Measured per step with `npm run bench` (macCormack, fixed budget):
+ *
+ *   grid       total    advect   pressure   dye    everything else
+ *   320x180    70.6      16.1      28.6     25.1        0.9
+ *   480x270   190.7      35.3      96.5     57.1        1.9
+ *   640x360   395.6      62.8     228.8    100.8        3.3
+ *
+ * What sets the ceiling has MOVED, and that is the part to keep in mind when
+ * changing NX/NY. Those are CPU-solver numbers: with the GPU solver on (G) the
+ * pressure column collapses to single-digit ms and stops being the limit at
+ * any of these sizes. Advection and dye then account for ~95% of what is left.
+ * Both are semi-Lagrangian gathers — the same shape as the solve that just
+ * ported well — so the next resolution step is two more shaders, not a better
+ * solver. Past ~1024 it is BOTH: see docs/WEBGPU.md §6.
  */
-const NX = 320;
-const NY = 180;
+const NX = 640;
+const NY = 480;
 
 /**
  * A FIXED sweep budget, not a convergence tolerance — the real-time half of
@@ -62,6 +83,32 @@ const NY = 180;
  */
 const PRESSURE_ITERS = Math.round(0.15 * Math.max(NX, NY));
 const PRESSURE_TOL = 0;
+
+/**
+ * Relaxation for the FIXED-BUDGET path, and deliberately NOT optimalOmega().
+ *
+ * optimalOmega minimises the ASYMPTOTIC rate, which SOR only reaches after
+ * O(N) sweeps. This runs 0.15*N of them, so what matters instead is the
+ * TRANSIENT — and SOR near omega = 2 amplifies the residual for tens of sweeps
+ * before it decays. Stopping inside that hump is worse than not over-relaxing
+ * at all, and red-black suffers it far worse than lexicographic does: at
+ * optimalOmega it left 48x the divergence, enough to make the velocity field
+ * visibly oscillate. Numbers, and why red-black is the sensitive one, in
+ * docs/WEBGPU.md §4.
+ *
+ * CONSTANT, not grid-dependent, and that is a consequence of PRESSURE_ITERS
+ * scaling with N: holding sweeps/N fixed holds the stopping point in the
+ * transient fixed too, so the best omega does not move. Measured 1.4-1.6 at
+ * every size from 160x120 to 400x300, flat to within 5% over 1.2-1.6. If the
+ * sweep budget ever became a constant instead, this would have to drop as the
+ * grid grew.
+ *
+ * 1.6 is near the floor for BOTH orderings, which is what makes it the right
+ * shared value: G must change the solver and nothing else, or the comparison
+ * stops being controlled. defaultParams keeps optimalOmega for headless
+ * reference runs, where the tolerance really does iterate to convergence.
+ */
+const PRESSURE_OMEGA = 1.6;
 
 /**
  * 'dipole'  self-propelling pair — the clearest check that advection moves
@@ -149,8 +196,51 @@ const sim = new Simulation(NX, NY, {
   scheme: 'macCormack',
   pressureIters: PRESSURE_ITERS,
   tol: PRESSURE_TOL,
+  omega: PRESSURE_OMEGA,
 });
 const fieldView = new FieldView(sim.g);
+const overlay = new PerfOverlay(stage);
+
+/**
+ * G cycles all three, and the ORDER is the point. Going CPU-lexicographic ->
+ * CPU-red-black -> GPU-red-black changes exactly one variable at each step:
+ * first the sweep ordering, then the hardware and the precision together. When
+ * the GPU picture looks wrong, that middle entry is what says whether the
+ * algorithm or the WGSL is at fault. See docs/WEBGPU.md §1.
+ *
+ * The GPU entry appends itself when the device is ready, and the sim switches
+ * to it then. Not awaited at startup: the first frame should not wait on a
+ * driver, and there is a correct thing to run in the meantime.
+ */
+const SOLVERS: PressureSolver[] = [cpuPressureSolver, cpuRedBlackSolver];
+let gpuSolver: GpuPressureSolver | null = null;
+let gpuName = '';
+
+void initGpu().then((ctx) => {
+  if (!ctx) return;
+  gpuSolver = new GpuPressureSolver(ctx, sim.g);
+  gpuName = describeGpu(ctx);
+  SOLVERS.push(gpuSolver);
+  sim.solver = gpuSolver;
+});
+
+/**
+ * Drops the GPU solver on any device-side failure, once. A GPU error is
+ * usually permanent (a lost device, an out-of-memory), so retrying it every
+ * frame turns one console line into thousands. It is always last in SOLVERS,
+ * so popping it also stops G cycling back onto it.
+ */
+function dropGpu(why: string): void {
+  if (!gpuSolver) return;
+  console.error(`[gpu] falling back to the CPU solver: ${why}`);
+  SOLVERS.pop();
+  gpuSolver = null;
+  sim.solver = cpuPressureSolver;
+}
+
+function toggleSolver(): void {
+  sim.solver = SOLVERS[(SOLVERS.indexOf(sim.solver) + 1) % SOLVERS.length];
+}
 
 const TRACER_NONE = TRACERS.findIndex((t) => t.name === 'none');
 
@@ -222,40 +312,77 @@ function nextTracer(): void {
   restart();
 }
 
-const onClick = (id: string, run: () => void): void =>
-  document.querySelector<HTMLButtonElement>(`#${id}`)!.addEventListener('click', run);
-onClick('restart', restart);
-onClick('toggleView', toggleView);
-onClick('nextScene', nextScene);
-onClick('nextTracer', nextTracer);
-onClick('toggleScheme', toggleScheme);
+/**
+ * One table, because a button and its key are the same action. Two parallel
+ * lists is how you end up with a button that has no shortcut.
+ */
+const ACTIONS: { id: string; key: string; run: () => void }[] = [
+  { id: 'restart', key: 'r', run: restart },
+  { id: 'toggleView', key: 'd', run: toggleView },
+  { id: 'nextScene', key: 's', run: nextScene },
+  { id: 'nextTracer', key: 't', run: nextTracer },
+  { id: 'toggleScheme', key: 'a', run: toggleScheme },
+  { id: 'toggleSolver', key: 'g', run: toggleSolver },
+  { id: 'togglePerf', key: 'p', run: () => overlay.toggle() },
+];
 
+for (const a of ACTIONS) {
+  document.querySelector<HTMLButtonElement>(`#${a.id}`)!.addEventListener('click', a.run);
+}
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'r' || e.key === 'R') restart();
-  if (e.key === 'd' || e.key === 'D') toggleView();
-  if (e.key === 's' || e.key === 'S') nextScene();
-  if (e.key === 't' || e.key === 'T') nextTracer();
-  if (e.key === 'a' || e.key === 'A') toggleScheme();
+  // Cmd+R, Cmd+S and Cmd+P are all browser shortcuts that collide with these.
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  ACTIONS.find((a) => a.key === e.key.toLowerCase())?.run();
 });
 window.addEventListener('resize', fitCanvas);
 
 fitCanvas();
 restart();
 
-function frame(): void {
-  sim.step();
+/**
+ * The one cost sim.perf cannot see: `step()` owns its own phase breakdown, but
+ * the draw happens out here. Reusing Profiler rather than keeping a hand-rolled
+ * average means the smoothing, the peak tracking and the units all come from
+ * the same place as every other number on the panel.
+ *
+ * begin() sits AFTER the step, not at the top of the frame — a Profiler
+ * measures from begin() to the first mark(), so starting it any earlier would
+ * quietly bill the whole step to 'draw'.
+ */
+const drawPerf = new Profiler();
+
+async function frame(): Promise<void> {
+  try {
+    await sim.step();
+  } catch (e) {
+    dropGpu(e instanceof Error ? e.message : String(e));
+    await sim.step();
+  }
+  drawPerf.begin();
   const { maxSpeed, divMax, divRms } = fieldView.draw(ctx, sim, VIEWS[viewIndex]);
+  drawPerf.mark('draw');
 
   readout.textContent =
     `scene ${SCENES[sceneIndex].name} (S)   view ${VIEWS[viewIndex]} (D)   ` +
     `dye ${TRACERS[tracerIndex].name} (T)   advect ${sim.params.scheme} (A)   ` +
-    `grid ${sim.g.nx}x${sim.g.ny}\n` +
+    `solver ${sim.solver.name} (G)   perf (P)   grid ${sim.g.nx}x${sim.g.ny}\n` +
     `t ${sim.time.toFixed(2)}   max speed ${maxSpeed.toFixed(3)}   ` +
     `dt ${sim.dt.toExponential(2)} (CFL ${sim.cfl.toFixed(2)})   ` +
     `SOR ${sim.iters} sweeps   ` +
     `div rms ${(100 * divRms).toFixed(3)}% of u/h (worst cell ±${divMax.toExponential(1)})`;
 
-  requestAnimationFrame(frame);
+  // Pure wiring: everything here is already measured and already smoothed by
+  // whoever owns it, and the panel decides how it reads.
+  const onGpu = gpuSolver !== null && sim.solver === gpuSolver ? gpuSolver : null;
+  overlay.update({
+    phases: sim.perf,
+    totals: drawPerf,
+    solver: sim.solver.name,
+    adapter: gpuName,
+    gpu: onGpu ? { ...onGpu.timings, hasDeviceTime: onGpu.hasDeviceTime } : undefined,
+  });
+
+  requestAnimationFrame(() => void frame());
 }
 
-requestAnimationFrame(frame);
+requestAnimationFrame(() => void frame());

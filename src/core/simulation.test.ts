@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { optimalOmega, Simulation } from './simulation.ts';
 import { addVortexCluster, addVortexPair } from '../scenes/testFields.ts';
 
-test('a long run stays finite and keeps removing divergence', () => {
+test('a long run stays finite and keeps removing divergence', async () => {
   const sim = new Simulation(32, 32, { pressureIters: 40 });
   sim.reset({ seed: addVortexPair });
 
-  for (let n = 0; n < 200; n++) sim.step();
+  for (let n = 0; n < 200; n++) await sim.step();
 
   assert.ok(sim.f.u.every(Number.isFinite), 'u went non-finite');
   assert.ok(sim.f.v.every(Number.isFinite), 'v went non-finite');
@@ -17,27 +17,27 @@ test('a long run stays finite and keeps removing divergence', () => {
   assert.ok(sim.time > 0, 'clock did not advance');
 });
 
-test('dt respects the CFL target and the dtMax cap', () => {
+test('dt respects the CFL target and the dtMax cap', async () => {
   const sim = new Simulation(32, 32, { cflTarget: 1.0, dtMax: 1 / 30 });
   sim.reset({ seed: addVortexPair });
 
   for (let n = 0; n < 50; n++) {
-    sim.step();
+    await sim.step();
     assert.ok(sim.dt <= 1 / 30 + 1e-12, `dt ${sim.dt} exceeded dtMax`);
     // The cap can hold dt BELOW the CFL target, but never above it.
     assert.ok(sim.cfl <= 1.0 + 1e-6, `CFL ${sim.cfl} exceeded target`);
   }
 });
 
-test('reset makes a run reproducible — required for comparing schemes', () => {
+test('reset makes a run reproducible — required for comparing schemes', async () => {
   const a = new Simulation(24, 24, { pressureIters: 20 });
   const b = new Simulation(24, 24, { pressureIters: 20 });
   a.reset({ seed: addVortexCluster });
   b.reset({ seed: addVortexCluster });
 
   for (let n = 0; n < 25; n++) {
-    a.step();
-    b.step();
+    await a.step();
+    await b.step();
   }
   for (let k = 0; k < a.f.u.length; k++) {
     assert.equal(a.f.u[k], b.f.u[k], `u[${k}] diverged between identical runs`);
@@ -45,13 +45,13 @@ test('reset makes a run reproducible — required for comparing schemes', () => 
   assert.equal(a.time, b.time);
 });
 
-test('dye decay is exponential in TIME, not per step', () => {
+test('dye decay is exponential in TIME, not per step', async () => {
   // Zero velocity: advection is the identity at cell centres, so the only
   // thing acting on dye is the decay — and the answer is exact.
   const sim = new Simulation(16, 16, { dyeDecay: 2 });
   sim.reset({ dye: (g, dye) => dye[0].fill(1) });
 
-  for (let n = 0; n < 30; n++) sim.step();
+  for (let n = 0; n < 30; n++) await sim.step();
 
   const expected = Math.exp(-2 * sim.time);
   assert.ok(

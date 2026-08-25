@@ -14,7 +14,7 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
-    "types": ["node"],
+    "types": ["node", "@webgpu/types"],
     "allowImportingTsExtensions": true
   },
   "include": ["src", "vite.config.ts"]

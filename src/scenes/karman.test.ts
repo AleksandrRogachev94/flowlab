@@ -9,11 +9,11 @@ import { karmanChannel } from './karman.ts';
 const solid = (sim: Simulation, i: number, j: number): boolean =>
   isSolidCell(sim.g, sim.f.label, i, j);
 
-function run(steps: number): Simulation {
+async function run(steps: number): Promise<Simulation> {
   // Stubbier than the real preset, but the same code path.
   const sim = new Simulation(96, 48, { pressureIters: 400 });
   sim.reset(karmanChannel(sim.g, { diameter: 0.25, cx: 0.5 }));
-  for (let n = 0; n < steps; n++) sim.step();
+  for (let n = 0; n < steps; n++) await sim.step();
   return sim;
 }
 
@@ -44,8 +44,8 @@ test('the cylinder rasterizes ASYMMETRICALLY, or the wake never sheds', () => {
   assert.notEqual(above, below, 'the staircase is symmetric — no shedding seed');
 });
 
-test('no flow passes through the cylinder', () => {
-  const sim = run(40);
+test('no flow passes through the cylinder', async () => {
+  const sim = await run(40);
   for (let j = 0; j < sim.g.ny; j++) {
     for (let i = 0; i <= sim.g.nx; i++) {
       if (!solid(sim, i - 1, j) && !solid(sim, i, j)) continue;
@@ -60,8 +60,8 @@ test('no flow passes through the cylinder', () => {
   }
 });
 
-test('the projection still clears divergence from the fluid around an obstacle', () => {
-  const sim = run(60);
+test('the projection still clears divergence from the fluid around an obstacle', async () => {
+  const sim = await run(60);
   assert.ok(sim.f.u.every(Number.isFinite), 'u went non-finite');
 
   // RMS over FLUID cells, matching what solvePressure's tolerance is stated

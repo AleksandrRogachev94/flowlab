@@ -141,6 +141,25 @@ export function rmsRemainingDivergence(
   return n > 0 ? Math.sqrt(sumSq / n) : 0;
 }
 
+/**
+ * RMS divergence over FLUID cells only — the denominator every solver states
+ * its tolerance relative to, and the "is there anything to do?" test.
+ *
+ * FLUID only, deliberately: divergence inside a solid is stale face data, and
+ * an Air outlet is SUPPOSED to be divergent. Either would inflate this and
+ * silently loosen a tolerance stated as a fraction of the real divergence.
+ */
+export function fluidDivRms(div: FieldArray, label: Uint8Array): number {
+  let sumSq = 0;
+  let n = 0;
+  for (let k = 0; k < div.length; k++) {
+    if (label[k] !== Cell.Fluid) continue;
+    sumSq += div[k] * div[k];
+    n += 1;
+  }
+  return n > 0 ? Math.sqrt(sumSq / n) : 0;
+}
+
 /** Multiple of 4, so a check only lands on a completed direction cycle. */
 const CHECK_EVERY = 12;
 
@@ -170,17 +189,7 @@ export function solvePressure(
   omega = 1.0,
   tol = 1e-3,
 ): number {
-  // FLUID cells only: divergence inside a solid is stale face data, and an Air
-  // outlet is SUPPOSED to be divergent — either would inflate this denominator
-  // and silently loosen a tolerance stated relative to the real divergence.
-  let sumSq = 0;
-  let nFluid = 0;
-  for (let k = 0; k < div.length; k++) {
-    if (label[k] !== Cell.Fluid) continue;
-    sumSq += div[k] * div[k];
-    nFluid += 1;
-  }
-  const divRms = nFluid > 0 ? Math.sqrt(sumSq / nFluid) : 0;
+  const divRms = fluidDivRms(div, label);
   if (divRms === 0) {
     // Already divergence-free, and p = 0 is the exact solution. NOT "any p":
     // subtractGradient applies p unconditionally, so returning a warm-started

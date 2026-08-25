@@ -8,7 +8,8 @@ import {
 import { applyOutflow, commitLabels } from './boundaries.ts';
 import { computeDivergence } from './divergence.ts';
 import { Cell, createFields, createGrid, type FieldArray, type Fields, type Grid } from './grid.ts';
-import { solvePressure } from './pressure.ts';
+import { Profiler } from './profiler.ts';
+import { cpuPressureSolver, type PressureSolver } from './pressureSolver.ts';
 import { subtractGradient } from './subtractGradient.ts';
 
 /** Writes an initial velocity field. Matches the scene helpers' signature. */
@@ -137,6 +138,14 @@ export class Simulation {
   dt = 0;
   /** Sweeps the last pressure solve used, out of params.pressureIters. */
   iters = 0;
+  /** Per-phase timings for the last step(). Always recording — see profiler.ts. */
+  readonly perf = new Profiler();
+  /**
+   * Swappable at runtime, so one Simulation can be flipped between CPU and GPU
+   * mid-run and the two compared on identical state — the same trick
+   * params.scheme already uses for advection.
+   */
+  solver: PressureSolver = cpuPressureSolver;
 
   // Rule 3: advection can't run in place (u self-advects), so these are
   // allocated once and ping-ponged by reference swap, never copied.
@@ -213,8 +222,15 @@ export class Simulation {
     return m;
   }
 
-  step(): void {
+  /**
+   * Async ONLY because of the GPU solver's readback (see PressureSolver). The
+   * CPU path never yields to the event loop for real: `await` on a plain
+   * number resolves in a microtask, before the next frame or timer can run, so
+   * nothing can observe the simulation mid-step.
+   */
+  async step(): Promise<void> {
     const { g, f, params: p } = this;
+    this.perf.begin();
     const uMax = this.maxFaceSpeed();
     // scale/gradScale both carry dt, so they are rebuilt every step; hoisting
     // them would silently use a stale timestep.
@@ -239,14 +255,31 @@ export class Simulation {
     }
     [f.u, this.uNext] = [this.uNext, f.u];
     [f.v, this.vNext] = [this.vNext, f.v];
+    this.perf.mark('advect');
 
     computeDivergence(g, f.u, f.v, this.div);
-    this.iters = solvePressure(g, f.p, this.div, f.label, scale, p.pressureIters, p.omega, p.tol);
+    this.perf.mark('div');
+
+    this.iters = await this.solver.solve(
+      g,
+      f.p,
+      this.div,
+      f.label,
+      scale,
+      p.pressureIters,
+      p.omega,
+      p.tol,
+    );
+    this.perf.mark('pressure');
+
     subtractGradient(g, f.p, f.u, f.v, f.label, gradScale);
     // Before the residual and before dye rides it: this is part of producing
     // the final velocity field, not a diagnostic. No-op on a closed box.
     applyOutflow(g, f.u, f.v, f.label);
+    this.perf.mark('gradient');
+
     computeDivergence(g, f.u, f.v, this.div); // now the residual
+    this.perf.mark('residual');
 
     // Dye rides the PROJECTED velocity, which is why this sits after the solve
     // instead of alongside advectVelocity: a divergence-free carrier cannot
@@ -275,6 +308,7 @@ export class Simulation {
     // After advection, not before: the source must hold its value at the END
     // of the step, or the stamp is carried off within the same step.
     this.dyeSource?.(g, f.dye, dt);
+    this.perf.mark('dye');
 
     this.dt = dt;
     this.time += dt;

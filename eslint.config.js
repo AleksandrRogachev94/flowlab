@@ -19,7 +19,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['**/*.test.ts'],
+    files: ['**/*.test.ts', '**/*.gputest.ts'],
     rules: {
       // node:test registers the promise returned by test() with the runner;
       // it isn't meant to be awaited at the call site.

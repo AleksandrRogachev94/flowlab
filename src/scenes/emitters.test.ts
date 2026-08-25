@@ -75,16 +75,16 @@ test('the jet is pure inflow, so the books do NOT balance on their own', () => {
   );
 });
 
-test('a net inflow needs an open outlet, and one Air column provides it', () => {
+test('a net inflow needs an open outlet, and one Air column provides it', async () => {
   // A closed box is all-Neumann, so a net inflow makes the system INCONSISTENT:
   // no p satisfies it, SOR burns every sweep against a residual floor it can
   // never cross, and the null-space component drives p away without bound.
   // One Air column pins p = 0 and the same problem becomes solvable.
   const CAP = 120;
-  const run = (labels?: LabelSeed) => {
+  const run = async (labels?: LabelSeed) => {
     const sim = new Simulation(N, N, { pressureIters: CAP });
     sim.reset({ labels, seed: wallJet().seed });
-    for (let n = 0; n < 60; n++) sim.step();
+    for (let n = 0; n < 60; n++) await sim.step();
 
     let pMax = 0;
     for (const x of sim.f.p) pMax = Math.max(pMax, Math.abs(x));
@@ -98,8 +98,8 @@ test('a net inflow needs an open outlet, and one Air column provides it', () => 
     return { iters: sim.iters, pMax, divRms: Math.sqrt(sumSq / count) };
   };
 
-  const closed = run();
-  const open = run(openRight());
+  const closed = await run();
+  const open = await run(openRight());
 
   assert.equal(closed.iters, CAP, 'a closed box should never meet tolerance here');
   assert.ok(open.iters < CAP, `open outlet still pinned at the cap (${open.iters})`);
@@ -111,13 +111,13 @@ test('a net inflow needs an open outlet, and one Air column provides it', () => 
   assert.ok(open.pMax * 100 < closed.pMax, `p drifted to ${open.pMax} despite an outlet`);
 });
 
-test('prescribed wall faces survive advection and projection unchanged', () => {
+test('prescribed wall faces survive advection and projection unchanged', async () => {
   const sim = new Simulation(N, N, { pressureIters: 200 });
   const jet = wallJet();
   sim.reset({ labels: openRight(), seed: jet.seed, dyeSource: jet.source });
   const wall = sim.f.u.slice();
 
-  for (let n = 0; n < 60; n++) sim.step();
+  for (let n = 0; n < 60; n++) await sim.step();
 
   for (let j = 0; j < sim.g.ny; j++) {
     // The INLET only. u[nx,j] is no longer prescribed: it fronts an Air cell,
@@ -134,7 +134,7 @@ test('prescribed wall faces survive advection and projection unchanged', () => {
   assert.ok(sim.iters < 200, `solve pinned at the cap (${sim.iters}) — RHS likely inconsistent`);
 });
 
-test('the dye source holds its band and carries downstream', () => {
+test('the dye source holds its band and carries downstream', async () => {
   const sim = new Simulation(N, N, { pressureIters: 200 });
   const jet = wallJet({ depthCells: 2 });
   sim.reset({ labels: openRight(), seed: jet.seed, dyeSource: jet.source });
@@ -146,7 +146,7 @@ test('the dye source holds its band and carries downstream', () => {
   // Seeded once by reset(), before any step.
   assert.deepEqual(at(0), [...defaultWallJet.colour]);
 
-  for (let n = 0; n < 60; n++) sim.step();
+  for (let n = 0; n < 60; n++) await sim.step();
 
   assert.deepEqual(at(0), [...defaultWallJet.colour], 'source did not hold its value');
   const far = at(mid)[2];
@@ -157,7 +157,7 @@ test('the dye source holds its band and carries downstream', () => {
   );
 });
 
-test('uniform through-flow is an exact steady solution', () => {
+test('uniform through-flow is an exact steady solution', async () => {
   // u = U everywhere (walls included), v = 0: already divergence-free, so
   // advect + project must return it bit-for-bit. Catches sign errors, the
   // wall-face bounds in subtractGradient, and half-cell offsets in sampling.
@@ -170,7 +170,7 @@ test('uniform through-flow is an exact steady solution', () => {
     },
   });
 
-  for (let n = 0; n < 20; n++) sim.step();
+  for (let n = 0; n < 20; n++) await sim.step();
 
   assert.ok(
     sim.f.u.every((x) => x === U),
