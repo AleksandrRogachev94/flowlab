@@ -2,10 +2,48 @@ import type { AdvectionScheme } from './advect.ts';
 import { CpuAdvector, type Advector } from './advector.ts';
 import { applyOutflow, commitLabels } from './boundaries.ts';
 import { computeDivergence } from './divergence.ts';
-import { Cell, createFields, createGrid, type FieldArray, type Fields, type Grid } from './grid.ts';
+import {
+  Cell,
+  createFields,
+  createGrid,
+  type FieldArray,
+  type FieldCtor,
+  type Fields,
+  type Grid,
+} from './grid.ts';
 import { Profiler } from './profiler.ts';
 import { cpuPressureSolver, type PressureSolver } from './pressureSolver.ts';
 import { subtractGradient } from './subtractGradient.ts';
+
+/**
+ * The fused-step seam: everything from velocity advection through dye
+ * advection as ONE device submit, replacing the advector + solver + host
+ * kernels for that stretch of step(). An interface here (like PressureSolver)
+ * so core/ keeps not depending on gpu/; the implementation is
+ * gpu/stepGpu.ts, and its comment explains what stays resident.
+ *
+ * Returns solver iterations (V-cycles), like PressureSolver.solve. On return,
+ * f.u / f.v / f.dye hold the step's results; f.p is NOT updated — the
+ * pressure lives on the device and warm-starts there. That staleness is safe
+ * (nothing on the host reads p between solves; a solver switched in later
+ * merely warm-starts from an old field) but it is a contract worth knowing.
+ */
+export interface GpuStep {
+  step(
+    f: Fields,
+    scheme: AdvectionScheme,
+    dt: number,
+    scale: number,
+    gradScale: number,
+    /** exp(-dyeDecay * dt), applied on the device — see the call site. 1 is
+     *  off, and is what a scene without decay passes. */
+    dyeKeep: number,
+    perf: Profiler,
+  ): Promise<number>;
+  /** Host fields changed under it (reset, frames on a CPU solver); the next
+   *  step() must re-upload u, v, p, label before trusting the device copy. */
+  invalidate(): void;
+}
 
 /** Writes an initial velocity field. Matches the scene helpers' signature. */
 export type Seed = (g: Grid, u: FieldArray, v: FieldArray) => void;
@@ -90,6 +128,17 @@ export interface SimulationParams {
    * U / dyeDecay, so pick that first and divide.
    */
   dyeDecay: number;
+  /**
+   * Recompute the post-step residual (`div`) only every Nth step. 1 keeps it
+   * exact, which is what the headless reference and the tests want.
+   *
+   * It is a DIAGNOSTIC — nothing in the step reads it — and at 1920x1080 the
+   * scan costs more than the dye advection it follows, so the browser asks for
+   * 4: the readout is smoothed and redrawn at frame rate either way, and no
+   * decision anywhere is made on a 60 Hz residual that a 15 Hz one would get
+   * wrong. It is still computed from what actually came back from the device.
+   */
+  residualEvery: number;
 }
 
 /**
@@ -115,6 +164,7 @@ export const defaultParams: SimulationParams = {
   omega: 0, // replaced by optimalOmega(nx, ny) in the constructor
   rho: 1.0,
   dyeDecay: 0,
+  residualEvery: 1,
 };
 
 /**
@@ -143,6 +193,27 @@ export class Simulation {
   solver: PressureSolver = cpuPressureSolver;
   /** Swappable for the same reason, and on the same terms — see Advector. */
   advector: Advector;
+  /**
+   * When set, step() hands the whole advect -> project -> dye stretch to it
+   * and `advector`/`solver` sit unused — the phase-wise seams above remain the
+   * comparison ladder, this is the production path. main.ts sets and clears it
+   * as the solver cycles.
+   */
+  stepper: GpuStep | null = null;
+
+  /**
+   * maxFaceSpeed()'s answer for the CURRENT u/v, or null if they have moved
+   * since. Three callers want it per frame — step()'s CFL, the view's arrow
+   * scale, and the `cfl` readout — and the last two run on the SAME field the
+   * next step()'s CFL will read, so caching collapses three full scans of u
+   * and v into one. Only step() and reset() write velocity, so those two
+   * places are the whole invalidation surface.
+   */
+  private uMax: number | null = null;
+
+  /** Steps taken, for params.residualEvery's phase. Monotonic across resets —
+   *  nothing depends on WHICH steps get a fresh residual, only how often. */
+  private steps = 0;
 
   // Rule 3: advection can't run in place (u self-advects), so these are
   // allocated once and ping-ponged by reference swap, never copied.
@@ -161,14 +232,27 @@ export class Simulation {
    * the width is what keeps a cylinder diameter or a jet band the same
    * physical size when the domain gets longer.
    */
-  constructor(nx: number, ny: number = nx, params: Partial<SimulationParams> = {}) {
+  /**
+   * `fieldCtor` picks the fields' precision — the option grid.ts's FieldArray
+   * union exists for. Float64Array stays the default so every headless test
+   * and benchmark keeps its reference precision; the browser passes
+   * Float32Array (see main.ts for the measured why). The ping-pong buffers
+   * must share the ctor, since a swap makes them BE the fields; `div` stays
+   * f64 — it never swaps, and it is the diagnostic worth keeping exact.
+   */
+  constructor(
+    nx: number,
+    ny: number = nx,
+    params: Partial<SimulationParams> = {},
+    fieldCtor: FieldCtor = Float64Array,
+  ) {
     this.params = { ...defaultParams, omega: optimalOmega(nx, ny), ...params };
     this.g = createGrid(nx, ny, 1 / ny);
-    this.f = createFields(this.g, Float64Array);
+    this.f = createFields(this.g, fieldCtor);
     this.div = new Float64Array(this.f.p.length);
-    this.uNext = new Float64Array(this.f.u.length);
-    this.vNext = new Float64Array(this.f.v.length);
-    this.dyeNext = this.f.dye.map(() => new Float64Array(this.f.p.length));
+    this.uNext = new fieldCtor(this.f.u.length);
+    this.vNext = new fieldCtor(this.f.v.length);
+    this.dyeNext = this.f.dye.map(() => new fieldCtor(this.f.p.length));
     this.advector = new CpuAdvector(this.g);
   }
 
@@ -201,6 +285,9 @@ export class Simulation {
     this.dyeSource?.(g, f.dye, 0);
     this.time = 0;
     this.dt = 0;
+    this.uMax = null;
+    // Everything above rewrote the host fields behind the device's back.
+    this.stepper?.invalidate();
   }
 
   /**
@@ -214,10 +301,12 @@ export class Simulation {
    * whole GPU advection it sat next to.
    */
   maxFaceSpeed(): number {
+    if (this.uMax !== null) return this.uMax;
     const { u, v } = this.f;
     let m = 0;
     for (let k = 0; k < u.length; k++) m = Math.max(m, Math.abs(u[k]));
     for (let k = 0; k < v.length; k++) m = Math.max(m, Math.abs(v[k]));
+    this.uMax = m;
     return m;
   }
 
@@ -237,51 +326,74 @@ export class Simulation {
     const scale = (p.rho * g.h * g.h) / dt;
     const gradScale = dt / (p.rho * g.h);
 
-    await this.advector.velocity(g, p.scheme, f.u, f.v, this.uNext, this.vNext, f.label, dt);
-    [f.u, this.uNext] = [this.uNext, f.u];
-    [f.v, this.vNext] = [this.vNext, f.v];
-    this.perf.mark('advect');
+    if (this.stepper) {
+      // The fused path: one submit covers everything from here to the dye
+      // advection, and the phases collapse into upload / solve / readback.
+      // The residual is still computed HERE, on what actually came back —
+      // that keeps it an honest check on the device's output, not an on-device
+      // number vouching for itself.
+      const keep = p.dyeDecay > 0 ? Math.exp(-p.dyeDecay * dt) : 1;
+      this.iters = await this.stepper.step(f, p.scheme, dt, scale, gradScale, keep, this.perf);
+      if (this.steps % p.residualEvery === 0) computeDivergence(g, f.u, f.v, this.div);
+      this.perf.mark('residual');
+    } else {
+      await this.advector.velocity(g, p.scheme, f.u, f.v, this.uNext, this.vNext, f.label, dt);
+      [f.u, this.uNext] = [this.uNext, f.u];
+      [f.v, this.vNext] = [this.vNext, f.v];
+      this.perf.mark('advect');
 
-    computeDivergence(g, f.u, f.v, this.div);
-    this.perf.mark('div');
+      computeDivergence(g, f.u, f.v, this.div);
+      this.perf.mark('div');
 
-    this.iters = await this.solver.solve(
-      g,
-      f.p,
-      this.div,
-      f.label,
-      scale,
-      p.pressureIters,
-      p.omega,
-      p.tol,
-    );
-    this.perf.mark('pressure');
+      this.iters = await this.solver.solve(
+        g,
+        f.p,
+        this.div,
+        f.label,
+        scale,
+        p.pressureIters,
+        p.omega,
+        p.tol,
+      );
+      this.perf.mark('pressure');
 
-    subtractGradient(g, f.p, f.u, f.v, f.label, gradScale);
-    // Before the residual and before dye rides it: this is part of producing
-    // the final velocity field, not a diagnostic. No-op on a closed box.
-    applyOutflow(g, f.u, f.v, f.label);
-    this.perf.mark('gradient');
+      subtractGradient(g, f.p, f.u, f.v, f.label, gradScale);
+      // Before the residual and before dye rides it: this is part of producing
+      // the final velocity field, not a diagnostic. No-op on a closed box.
+      applyOutflow(g, f.u, f.v, f.label);
+      this.perf.mark('gradient');
 
-    computeDivergence(g, f.u, f.v, this.div); // now the residual
-    this.perf.mark('residual');
+      // now the residual
+      if (this.steps % p.residualEvery === 0) computeDivergence(g, f.u, f.v, this.div);
+      this.perf.mark('residual');
 
-    // Dye rides the PROJECTED velocity, which is why this sits after the solve
-    // instead of alongside advectVelocity: a divergence-free carrier cannot
-    // artificially concentrate or thin the tracer. Passive, so nothing here
-    // feeds back into u/v and the step is otherwise unaffected by it.
-    //
-    // Channels are fully independent — same velocity, no coupling — which is
-    // what lets the GPU advector carry all three on one backtrace.
-    await this.advector.dye(g, p.scheme, f.u, f.v, f.dye, this.dyeNext, f.label, dt);
-    for (let c = 0; c < f.dye.length; c++) {
-      [f.dye[c], this.dyeNext[c]] = [this.dyeNext[c], f.dye[c]];
+      // Dye rides the PROJECTED velocity, which is why this sits after the
+      // solve instead of alongside advectVelocity: a divergence-free carrier
+      // cannot artificially concentrate or thin the tracer. Passive, so
+      // nothing here feeds back into u/v and the step is otherwise unaffected
+      // by it.
+      //
+      // Channels are fully independent — same velocity, no coupling — which is
+      // what lets the GPU advector carry all three on one backtrace.
+      await this.advector.dye(g, p.scheme, f.u, f.v, f.dye, this.dyeNext, f.label, dt);
+      for (let c = 0; c < f.dye.length; c++) {
+        [f.dye[c], this.dyeNext[c]] = [this.dyeNext[c], f.dye[c]];
+      }
     }
+    // u and v have moved; the next maxFaceSpeed() must rescan.
+    this.uMax = null;
 
     // Decay BEFORE the source, so the source region stays exactly at its set
     // value. Exponential in dt, not a fixed factor per step, or the fade rate
     // would change with the timestep.
-    if (p.dyeDecay > 0) {
+    //
+    // Skipped under the fused stepper: it applies the same factor on the
+    // device (project.wgsl's `decay`), which is legitimate because advection
+    // is LINEAR in the dye and the factor is a spatial constant — scaling
+    // before or after the backtrace gives the same field. 6M multiplies a
+    // frame is the difference, and at 1920x1080 that was the single most
+    // expensive thing left on the host.
+    if (p.dyeDecay > 0 && !this.stepper) {
       const keep = Math.exp(-p.dyeDecay * dt);
       for (const c of f.dye) for (let k = 0; k < c.length; k++) c[k] *= keep;
     }
@@ -293,6 +405,7 @@ export class Simulation {
 
     this.dt = dt;
     this.time += dt;
+    this.steps++;
   }
 
   /** CFL actually achieved by the last step — dtMax may have capped it. */

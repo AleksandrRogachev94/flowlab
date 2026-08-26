@@ -45,7 +45,7 @@ const SMOOTH_PARAMS_BYTES = 32;
 /** multigrid.wgsl's uniform block: nx, ny, cnx, cny. */
 const LEVEL_PARAMS_BYTES = 16;
 
-interface LevelBuffers {
+export interface LevelBuffers {
   nx: number;
   ny: number;
   groupsX: number;
@@ -60,10 +60,13 @@ export class GpuMultigridSolver implements PressureSolver {
   readonly name = 'gpu-mg';
 
   private readonly device: GPUDevice;
-  private readonly cycles: number;
+  readonly cycles: number;
   private readonly bytes: number;
 
-  private readonly levels: LevelBuffers[];
+  /** Non-private, like the record methods below: the fused stepper (stepGpu.ts)
+   *  writes the fine level's b from its divergence kernel, reads x as the
+   *  resident pressure, and owns the pass the cycles are recorded into. */
+  readonly levels: LevelBuffers[];
   private readonly readBuf: GPUBuffer;
 
   private readonly smoothPipeline: GPUComputePipeline;
@@ -83,8 +86,9 @@ export class GpuMultigridSolver implements PressureSolver {
   private readonly queryResolve: GPUBuffer | null = null;
   private readonly queryRead: GPUBuffer | null = null;
 
-  // Host staging allocated once, never in the frame loop.
-  private readonly pF32: Float32Array<ArrayBuffer>;
+  // Host staging allocated once, never in the frame loop. pF32 is reused by
+  // the fused stepper for its once-per-invalidate warm-start upload.
+  readonly pF32: Float32Array<ArrayBuffer>;
   private readonly bF32: Float32Array<ArrayBuffer>;
   private readonly labelU32: Uint32Array<ArrayBuffer>;
 
@@ -249,9 +253,20 @@ export class GpuMultigridSolver implements PressureSolver {
     }
   }
 
+  /** Records the label coarsening chain: each level's labels derive from the
+   *  one above, and the pass's implicit barriers order the chain correctly.
+   *  Per solve() here; the fused stepper records it only when labels change. */
+  recordCoarsenLabels(pass: GPUComputePassEncoder): void {
+    pass.setPipeline(this.coarsenPipeline);
+    for (let l = 0; l < this.levels.length - 1; l++) {
+      pass.setBindGroup(0, this.coarsenGroups[l]);
+      pass.dispatchWorkgroups(this.levels[l + 1].groupsX, this.levels[l + 1].groupsY);
+    }
+  }
+
   /** Records one V-cycle, recursively — the recursion happens at ENCODE time
    *  on the host; the GPU sees a flat, ordered list of dispatches. */
-  private recordVCycle(pass: GPUComputePassEncoder, l: number): void {
+  recordVCycle(pass: GPUComputePassEncoder, l: number): void {
     const lv = this.levels[l];
     const smoothPair = (): void => {
       pass.setPipeline(this.smoothPipeline);
@@ -332,13 +347,8 @@ export class GpuMultigridSolver implements PressureSolver {
           ? { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
           : undefined,
       });
-      // Labels first: each level's labels derive from the one above, and the
-      // pass's implicit barriers order the chain correctly.
-      pass.setPipeline(this.coarsenPipeline);
-      for (let l = 0; l < this.levels.length - 1; l++) {
-        pass.setBindGroup(0, this.coarsenGroups[l]);
-        pass.dispatchWorkgroups(this.levels[l + 1].groupsX, this.levels[l + 1].groupsY);
-      }
+      // Labels first — see recordCoarsenLabels.
+      this.recordCoarsenLabels(pass);
       for (let c = 0; c < this.cycles; c++) this.recordVCycle(pass, 0);
       pass.end();
 

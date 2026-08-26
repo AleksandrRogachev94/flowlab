@@ -44,6 +44,9 @@ export interface GpuPanel {
   device: number;
   /** Whether `device` is real. See GpuPressureSolver.hasDeviceTime. */
   hasDeviceTime: boolean;
+  /** What the device numbers cover — 'pressure solve' on the standalone
+   *  solvers, 'whole step' under the fused stepper. */
+  what: string;
 }
 
 export interface PerfUpdate {
@@ -113,9 +116,9 @@ export function formatPanel(u: PerfUpdate, frameMs: number): string {
   lines.push(`${'frame'.padEnd(W_NAME)}${ms(frameMs)} ms   ${fps.toFixed(1)} fps`);
 
   if (u.gpu) {
-    const { upload, wait, device, hasDeviceTime } = u.gpu;
+    const { upload, wait, device, hasDeviceTime, what } = u.gpu;
     lines.push('');
-    lines.push('pressure solve on the GPU, ms:');
+    lines.push(`${what} on the GPU, ms:`);
     // Decomposed so the parts ADD UP and none of them overlap. `wait` contains
     // the compute, so showing it next to `device` invites reading one as extra
     // cost on top of the other; splitting out the remainder is the number that

@@ -571,3 +571,59 @@ low edge, where positive u is the backflow), and one in `simulation.test.ts`
 asserting the invariant through `step()` — because the ORDER is half the
 contract. The clamp has to run after the projection, which is what creates the
 reversal in the first place.
+
+## 11. Step 4: the fused step, and 1920x1080
+
+§8 counted the three round trips and named what removes them; this step
+removed them. `gpu/project.wgsl` ports the last three host kernels —
+`computeDivergence` (fused with the `b = -scale·div` fold, so the multigrid's
+uniforms stay constant), `subtractGradient`, and `applyOutflow` — and
+`gpu/stepGpu.ts` records the entire step into ONE submit:
+
+    advect u,v -> copy result over uIn/vIn -> divergence -> V-cycles
+    -> subtract gradient (in place) -> outflow -> advect dye
+
+The stepper owns no pipelines beyond the three glue kernels and no field
+buffers at all: it composes GpuAdvector (buffers + dispatch recording) and
+GpuMultigridSolver (levels + V-cycle), which keep their standalone seams for
+the G/A ladder and the gputests. The copy-back-over-uIn trick is what lets
+every existing bind group stand: uIn/vIn simply ARE the velocity from that
+point on — the projection updates them in place, the dye carrier already
+points at them, and next frame's advection consumes them, resident.
+
+What still crosses the bus, per frame: dye up (the host mirror is
+authoritative — decay and the scene's `DyeSource` closure run there, which is
+why every source works unchanged), u/v/dye down (CFL, the residual diagnostic,
+the arrows, the canvas draw). `p` never crosses: it warm-starts where it
+lives. `invalidate()` re-syncs after a reset or frames stepped on another
+solver, and re-runs the label coarsening — the one per-frame dispatch chain
+that became per-scene.
+
+Two host-side companions, both measured at 1920x1080 before they were made:
+the browser Simulation now runs Float32 fields (the FieldArray union's other
+arm; staging copies become memcpys, every host loop moves half the bytes —
+headless tests keep f64), and the draw stopped rebuilding the world per frame
+(the 2M-cell speed/hypot loop now runs only for the speed view, the solid
+mask is a cached Path2D).
+
+Measured on karman, 1920x1080, MacCormack, apple/metal-3, headless Chrome:
+
+|       | before (phase-wise) | after (fused)   |
+| ----- | ------------------- | --------------- |
+| step  | 138 ms              | 69 ms           |
+| draw  | 48 ms               | 10 ms           |
+| frame | 196 ms / 5.1 fps    | ~60 ms / 17 fps |
+
+Inside the 69: upload 5.6 (nearly all dye), the await 37.2 (28.4 of it
+on-device — the multigrid's 3 V-cycles dominate), readback 22.6 (a 40 MB
+copy out of mapped memory), residual 3.2. The correctness gate is
+`project.gputest.ts` (max diff ~2e-7 against the f64 kernels, the usual f32
+floor) plus the ladder itself: G still walks every rung, and the fused path
+is a rung of its own — active exactly while gpu-mg is selected — so any
+doubt about it is one keypress from a phase-wise CPU diff.
+
+Where the remaining frame goes, for whoever picks this up next: the V-cycle
+count (3 is §9's choice; the physics-indifference measurements suggest 2 is
+worth trying), the readback (only the DRAW truly needs dye on the host — a
+WebGPU render path would keep it resident and retire the canvas blit too),
+and the residual diagnostic, which is a third of the host time left.

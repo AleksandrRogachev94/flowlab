@@ -40,6 +40,10 @@ export class FieldView {
   private readonly heatmap: Heatmap;
   private readonly speed: Float64Array;
   private readonly vort: Float64Array;
+  /** Cached solid-cell mask — see drawSolids. */
+  private solidsPath: Path2D | null = null;
+  private solidsW = 0;
+  private solidsH = 0;
 
   constructor(g: Grid) {
     this.heatmap = new Heatmap(g.nx, g.ny);
@@ -47,29 +51,49 @@ export class FieldView {
     this.vort = new Float64Array(g.nx * g.ny);
   }
 
+  /** The labels changed (a restart, a scene switch); the cached solid mask no
+   *  longer matches and the next draw rebuilds it. */
+  invalidateSolids(): void {
+    this.solidsPath = null;
+  }
+
   draw(ctx: CanvasRenderingContext2D, sim: Simulation, view: View): ViewStats {
     const { g, f, div } = sim;
 
-    let maxSpeed = 0;
+    // FLUID cells only: an Air outlet is supposed to be divergent and a
+    // solid's faces are frozen boundary data — either would blow out the
+    // stats with values nothing is solving for.
     let divMax = 0;
     let divSq = 0;
     let fluidCells = 0;
-    for (let j = 0; j < g.ny; j++) {
-      for (let i = 0; i < g.nx; i++) {
-        const k = idxP(g, i, j);
-        const [cu, cv] = cellVelocity(g, f.u, f.v, i, j);
-        const s = Math.hypot(cu, cv);
-        this.speed[k] = s;
-        // FLUID cells only: an Air outlet is supposed to be divergent and a
-        // solid's faces are frozen boundary data — either would blow out the
-        // stats with values nothing is solving for.
-        if (f.label[k] !== Cell.Fluid) continue;
-        if (s > maxSpeed) maxSpeed = s;
-        const d = Math.abs(div[k]);
-        if (d > divMax) divMax = d;
-        divSq += d * d;
-        fluidCells++;
+    for (let k = 0; k < div.length; k++) {
+      if (f.label[k] !== Cell.Fluid) continue;
+      const d = Math.abs(div[k]);
+      if (d > divMax) divMax = d;
+      divSq += d * d;
+      fluidCells++;
+    }
+
+    // The cell-centred speed field is filled only for the view that shows it.
+    // It used to be built every frame, and at 1920x1080 that one loop — 2M
+    // cellVelocity gathers plus a Math.hypot each — cost more than the entire
+    // GPU pressure solve it was drawn next to. Every other consumer of
+    // maxSpeed (the arrows' refSpeed, divRms's normalization) only needs a
+    // scale, and the FACE max is that scale: it brackets the cell-centred max
+    // from above by at most one face's worth of averaging.
+    let maxSpeed = 0;
+    if (view === 'speed') {
+      for (let j = 0; j < g.ny; j++) {
+        for (let i = 0; i < g.nx; i++) {
+          const k = idxP(g, i, j);
+          const [cu, cv] = cellVelocity(g, f.u, f.v, i, j);
+          const s = Math.sqrt(cu * cu + cv * cv);
+          this.speed[k] = s;
+          if (f.label[k] === Cell.Fluid && s > maxSpeed) maxSpeed = s;
+        }
       }
+    } else {
+      maxSpeed = sim.maxFaceSpeed();
     }
 
     const divRms = fluidCells ? Math.sqrt(divSq / fluidCells) / ((maxSpeed || 1) / g.h) : 0;
@@ -153,22 +177,31 @@ export class FieldView {
    * pixel's coverage a single time, so interior edges disappear.
    */
   private drawSolids(ctx: CanvasRenderingContext2D, g: Grid, label: Uint8Array): void {
+    const w = ctx.canvas.width;
     const h = ctx.canvas.height;
-    const cw = ctx.canvas.width / g.nx;
-    const ch = h / g.ny;
 
-    ctx.beginPath();
-    for (let j = 0; j < g.ny; j++) {
-      // Same y flip as Heatmap.draw and gridToScreen.
-      const y = h - (j + 1) * ch;
-      for (let i = 0; i < g.nx; i++) {
-        if (label[idxP(g, i, j)] === Cell.Solid) ctx.rect(i * cw, y, cw, ch);
+    // The union is CACHED as a Path2D: labels change only on restart() (which
+    // calls invalidateSolids) and the geometry only on resize (caught by the
+    // size check), yet the scan is over every cell — 2M label reads a frame at
+    // 1920x1080 to rediscover the same cylinder.
+    if (!this.solidsPath || w !== this.solidsW || h !== this.solidsH) {
+      this.solidsW = w;
+      this.solidsH = h;
+      this.solidsPath = new Path2D();
+      const cw = w / g.nx;
+      const ch = h / g.ny;
+      for (let j = 0; j < g.ny; j++) {
+        // Same y flip as Heatmap.draw and gridToScreen.
+        const y = h - (j + 1) * ch;
+        for (let i = 0; i < g.nx; i++) {
+          if (label[idxP(g, i, j)] === Cell.Solid) this.solidsPath.rect(i * cw, y, cw, ch);
+        }
       }
     }
     // Pale, not black: black reads as a hole in the background, and a light
     // body stays legible under both the dark dye view and the dark-at-zero
     // vorticity map. It is also what reference images of this benchmark use.
     ctx.fillStyle = '#b4becc';
-    ctx.fill();
+    ctx.fill(this.solidsPath);
   }
 }

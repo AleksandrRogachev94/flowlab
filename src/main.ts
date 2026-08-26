@@ -11,6 +11,7 @@ import { describeGpu, initGpu } from './gpu/device.ts';
 import { GpuAdvector } from './gpu/advectGpu.ts';
 import { GpuMultigridSolver } from './gpu/multigridGpu.ts';
 import { GpuPressureSolver } from './gpu/pressureGpu.ts';
+import { GpuStepper } from './gpu/stepGpu.ts';
 import { karmanChannel } from './scenes/karman.ts';
 import { wallJet } from './scenes/emitters.ts';
 import { openRight } from './scenes/obstacles.ts';
@@ -52,8 +53,8 @@ const readout = document.querySelector<HTMLPreElement>('#readout')!;
  * again. The next resolution step is therefore a better SOLVER, not another
  * shader — see docs/WEBGPU.md §6.
  */
-const NX = 1920;
-const NY = 1080;
+const NX = 1600;
+const NY = 900;
 
 /**
  * A FIXED sweep budget, not a convergence tolerance — the real-time half of
@@ -195,12 +196,28 @@ const TRACERS: Tracer[] = [
  * for the picture; if the target is frame rate rather than detail, dropping to
  * 320x180 with MacCormack beats 480x270 without it.
  */
-const sim = new Simulation(NX, NY, {
-  scheme: 'macCormack',
-  pressureIters: PRESSURE_ITERS,
-  tol: PRESSURE_TOL,
-  omega: PRESSURE_OMEGA,
-});
+/**
+ * Float32 fields in the browser — the precision study's other arm, and at this
+ * grid a straight bandwidth win: every remaining host loop (CFL scan, residual,
+ * decay, the draw's stats) moves half the bytes, and the GPU staging copies
+ * become same-type memcpys instead of 2M-element f64->f32 conversions. The
+ * headless tests and benchmarks keep the Float64Array default, so the CPU
+ * reference stays the reference.
+ */
+const sim = new Simulation(
+  NX,
+  NY,
+  {
+    scheme: 'macCormack',
+    pressureIters: PRESSURE_ITERS,
+    tol: PRESSURE_TOL,
+    omega: PRESSURE_OMEGA,
+    // A diagnostic, and the last O(cells) host loop in the frame — see
+    // SimulationParams.residualEvery. The headless default stays 1.
+    residualEvery: 4,
+  },
+  Float32Array,
+);
 const fieldView = new FieldView(sim.g);
 const overlay = new PerfOverlay(stage);
 
@@ -220,18 +237,48 @@ const overlay = new PerfOverlay(stage);
 const SOLVERS: PressureSolver[] = [cpuPressureSolver, cpuRedBlackSolver, new CpuMultigridSolver()];
 let gpuSolvers: (GpuPressureSolver | GpuMultigridSolver)[] = [];
 let gpuName = '';
+/**
+ * The fused whole-step path (gpu/stepGpu.ts) — active exactly while the
+ * selected solver is gpu-mg, since the multigrid it records IS that solver.
+ * Cycling G to anything else falls back to the phase-wise seams, which is
+ * what keeps the ladder's one-variable-at-a-time comparisons honest: the
+ * fused path is a rung of its own, not a modifier on every rung.
+ */
+let stepper: GpuStepper | null = null;
+
+/**
+ * Point sim.stepper at the fused path iff the selected solver is the one it
+ * embeds. Two things make this a function and not an assignment in
+ * toggleSolver():
+ *
+ *   - `stepper` is null before initGpu resolves and after dropGpu, so the
+ *     answer is not simply "is the solver gpu-mg".
+ *   - re-ENTERING the fused path has to invalidate. While another solver was
+ *     selected the host advanced u, v and dye on its own, and the device's
+ *     resident copies went stale; without this the first fused frame back
+ *     would advect a field from however many frames ago.
+ */
+function syncStepper(): void {
+  const next = sim.solver.name === 'gpu-mg' ? stepper : null;
+  if (next) next.invalidate();
+  sim.stepper = next;
+}
 
 void initGpu().then((ctx) => {
   if (!ctx) return;
-  gpuSolvers = [new GpuPressureSolver(ctx, sim.g), new GpuMultigridSolver(ctx, sim.g)];
+  const mg = new GpuMultigridSolver(ctx, sim.g);
+  gpuSolvers = [new GpuPressureSolver(ctx, sim.g), mg];
   gpuName = describeGpu(ctx);
   SOLVERS.push(...gpuSolvers);
-  sim.solver = gpuSolvers[1];
+  sim.solver = mg;
   // Not on the G cycle: G exists to compare pressure SOLVERS, and swapping
   // advection underneath it would stop that being one variable at a time.
   // Advection has no algorithmic choice to make here — the GPU kernel is the
   // same scheme A already toggles — so it simply takes over when available.
-  sim.advector = new GpuAdvector(ctx, sim.g);
+  const adv = new GpuAdvector(ctx, sim.g);
+  sim.advector = adv;
+  stepper = new GpuStepper(ctx, sim.g, adv, mg);
+  syncStepper();
 });
 
 /**
@@ -245,12 +292,15 @@ function dropGpu(why: string): void {
   console.error(`[gpu] falling back to the CPU: ${why}`);
   SOLVERS.length -= gpuSolvers.length;
   gpuSolvers = [];
+  stepper = null;
   sim.solver = cpuPressureSolver;
+  syncStepper();
   sim.advector = new CpuAdvector(sim.g);
 }
 
 function toggleSolver(): void {
   sim.solver = SOLVERS[(SOLVERS.indexOf(sim.solver) + 1) % SOLVERS.length];
+  syncStepper();
 }
 
 const TRACER_NONE = TRACERS.findIndex((t) => t.name === 'none');
@@ -304,6 +354,7 @@ function restart(): void {
   // 'none'. `ownDye` only picks the DEFAULT on entry, in nextScene.
   const tracer = TRACERS[tracerIndex];
   sim.reset({ ...spec, dye: tracer.seed ?? spec.dye, dyeSource: dyeSourceFor(def, spec, tracer) });
+  fieldView.invalidateSolids();
 }
 function toggleScheme(): void {
   sim.params.scheme = sim.params.scheme === 'macCormack' ? 'semiLagrangian' : 'macCormack';
@@ -385,14 +436,23 @@ async function frame(): Promise<void> {
     `div rms ${(100 * divRms).toFixed(3)}% of u/h (worst cell ±${divMax.toExponential(1)})`;
 
   // Pure wiring: everything here is already measured and already smoothed by
-  // whoever owns it, and the panel decides how it reads.
-  const onGpu = gpuSolvers.find((s) => s === sim.solver) ?? null;
+  // whoever owns it, and the panel decides how it reads. When the fused
+  // stepper is active the solver's own timings are dead (solve() never runs),
+  // so the stepper's take their place — and `what` says the device number now
+  // covers the whole step, not just the pressure solve.
+  const onGpu = sim.stepper ? stepper : (gpuSolvers.find((s) => s === sim.solver) ?? null);
   overlay.update({
     phases: sim.perf,
     totals: drawPerf,
     solver: sim.solver.name,
     adapter: gpuName,
-    gpu: onGpu ? { ...onGpu.timings, hasDeviceTime: onGpu.hasDeviceTime } : undefined,
+    gpu: onGpu
+      ? {
+          ...onGpu.timings,
+          hasDeviceTime: onGpu.hasDeviceTime,
+          what: onGpu === stepper ? 'whole step' : 'pressure solve',
+        }
+      : undefined,
   });
 
   requestAnimationFrame(() => void frame());

@@ -22,9 +22,13 @@ import shaderSource from './advect.wgsl?raw';
  * of shared state whose freshness is not obvious from this file alone.
  *
  * Both round trips disappear together, not one at a time: they exist because
- * divergence, the projection and the dye source still run on the host. Port
- * those and the fields simply stay resident — the shaders and bind groups
- * below are unchanged by that.
+ * divergence, the projection and the dye source still run on the host. That
+ * port now exists — stepGpu.ts records recordVelocity() and recordDye() into
+ * ITS pass, against these same buffers, and never calls velocity()/dye() at
+ * all. The methods here remain the standalone path: what runs when only
+ * advection is on the GPU, and what the gputests pin against the CPU. The
+ * buffers and staging arrays are non-private for exactly that composition;
+ * nothing else reads them.
  */
 
 /** Threads per workgroup, one axis. MUST match @workgroup_size in advect.wgsl. */
@@ -53,31 +57,32 @@ export class GpuAdvector implements Advector {
   private readonly nx: number;
   private readonly ny: number;
   private readonly h: number;
-  private readonly uLen: number;
-  private readonly vLen: number;
-  private readonly dyeLen: number;
-  private readonly uBytes: number;
-  private readonly vBytes: number;
+  readonly uLen: number;
+  readonly vLen: number;
+  readonly dyeLen: number;
+  readonly uBytes: number;
+  readonly vBytes: number;
 
-  // Inputs: refilled from the host every step.
-  private readonly uIn: GPUBuffer;
-  private readonly vIn: GPUBuffer;
-  private readonly dyeIn: GPUBuffer;
-  private readonly labelBuf: GPUBuffer;
+  // Inputs: refilled from the host every step on the standalone path. Under
+  // the fused stepper they hold the RESIDENT velocity instead — see stepGpu.ts.
+  readonly uIn: GPUBuffer;
+  readonly vIn: GPUBuffer;
+  readonly dyeIn: GPUBuffer;
+  readonly labelBuf: GPUBuffer;
   private readonly paramsBuf: GPUBuffer;
   // Outputs. `A` takes the forward pass, `B` the MacCormack correction — so
   // the result is in A for semiLagrangian and in B for macCormack, and that
   // is the only thing the scheme changes on this side.
-  private readonly uA: GPUBuffer;
-  private readonly uB: GPUBuffer;
-  private readonly vA: GPUBuffer;
-  private readonly vB: GPUBuffer;
-  private readonly dyeA: GPUBuffer;
-  private readonly dyeB: GPUBuffer;
+  readonly uA: GPUBuffer;
+  readonly uB: GPUBuffer;
+  readonly vA: GPUBuffer;
+  readonly vB: GPUBuffer;
+  readonly dyeA: GPUBuffer;
+  readonly dyeB: GPUBuffer;
   // MAP_READ cannot be combined with STORAGE, so results are copied here.
   // One buffer for u and v together: two mapAsync calls would be two stalls.
-  private readonly velRead: GPUBuffer;
-  private readonly dyeRead: GPUBuffer;
+  readonly velRead: GPUBuffer;
+  readonly dyeRead: GPUBuffer;
 
   private readonly pipelines: Record<EntryPoint, GPUComputePipeline>;
   /** One per (src, orig, dst) triple the six kernels need. */
@@ -85,10 +90,10 @@ export class GpuAdvector implements Advector {
 
   // Host staging, allocated once (Rule 3). These also do the f64 -> f32
   // conversion, which is why they are typed arrays and not raw buffers.
-  private readonly uHost: Float32Array<ArrayBuffer>;
-  private readonly vHost: Float32Array<ArrayBuffer>;
-  private readonly dyeHost: Float32Array<ArrayBuffer>;
-  private readonly labelHost: Uint32Array<ArrayBuffer>;
+  readonly uHost: Float32Array<ArrayBuffer>;
+  readonly vHost: Float32Array<ArrayBuffer>;
+  readonly dyeHost: Float32Array<ArrayBuffer>;
+  readonly labelHost: Uint32Array<ArrayBuffer>;
   private readonly paramsData = new ArrayBuffer(PARAMS_BYTES);
   private readonly paramsU32 = new Uint32Array(this.paramsData);
   private readonly paramsF32 = new Float32Array(this.paramsData);
@@ -127,8 +132,10 @@ export class GpuAdvector implements Advector {
     const buffer = (label: string, length: number, usage: number): GPUBuffer =>
       device.createBuffer({ label, size: length * 4, usage });
 
-    this.uIn = buffer('u-in', this.uLen, input);
-    this.vIn = buffer('v-in', this.vLen, input);
+    // COPY_SRC on the velocity inputs is for the fused stepper alone: it holds
+    // the projected field in these buffers and reads THEM back, not A/B.
+    this.uIn = buffer('u-in', this.uLen, input | GPUBufferUsage.COPY_SRC);
+    this.vIn = buffer('v-in', this.vLen, input | GPUBufferUsage.COPY_SRC);
     this.dyeIn = buffer('dye-in', this.dyeLen, input);
     this.labelBuf = buffer('label', cells, input);
     this.uA = buffer('u-hat', this.uLen, output);
@@ -239,15 +246,7 @@ export class GpuAdvector implements Advector {
     const mac = scheme === 'macCormack';
     const encoder = this.device.createCommandEncoder({ label: 'advect-velocity' });
     const pass = encoder.beginComputePass({ label: 'advect-velocity' });
-    // u and v are independent gathers over the same read-only inputs, so the
-    // order of these two is free; the correction must follow both, and the
-    // barrier that guarantees it is inserted by WebGPU between dispatches.
-    this.dispatch(pass, 'advect_u', this.bind.uFwd, this.nx + 1, this.ny);
-    this.dispatch(pass, 'advect_v', this.bind.vFwd, this.nx, this.ny + 1);
-    if (mac) {
-      this.dispatch(pass, 'correct_u', this.bind.uCor, this.nx + 1, this.ny);
-      this.dispatch(pass, 'correct_v', this.bind.vCor, this.nx, this.ny + 1);
-    }
+    this.recordVelocity(pass, mac);
     pass.end();
     encoder.copyBufferToBuffer(mac ? this.uB : this.uA, 0, this.velRead, 0, this.uBytes);
     encoder.copyBufferToBuffer(mac ? this.vB : this.vA, 0, this.velRead, this.uBytes, this.vBytes);
@@ -292,9 +291,7 @@ export class GpuAdvector implements Advector {
     const mac = scheme === 'macCormack';
     const encoder = this.device.createCommandEncoder({ label: 'advect-dye' });
     const pass = encoder.beginComputePass({ label: 'advect-dye' });
-    // One dispatch for all three channels: they share the backtrace.
-    this.dispatch(pass, 'advect_dye', this.bind.dFwd, this.nx, this.ny);
-    if (mac) this.dispatch(pass, 'correct_dye', this.bind.dCor, this.nx, this.ny);
+    this.recordDye(pass, mac);
     pass.end();
     encoder.copyBufferToBuffer(mac ? this.dyeB : this.dyeA, 0, this.dyeRead, 0, this.dyeLen * 4);
     queue.submit([encoder.finish()]);
@@ -306,6 +303,30 @@ export class GpuAdvector implements Advector {
       qOut[c].set(new Float32Array(mapped, c * cells * 4, cells));
     }
     this.dyeRead.unmap();
+  }
+
+  /**
+   * The velocity dispatches alone, into a pass the CALLER owns — the seam the
+   * fused stepper composes over. u and v are independent gathers over the same
+   * read-only inputs, so the order of the two forward passes is free; the
+   * correction must follow both, and the barrier that guarantees it is
+   * inserted by WebGPU between dispatches. Result lands in uA/vA
+   * (semiLagrangian) or uB/vB (macCormack).
+   */
+  recordVelocity(pass: GPUComputePassEncoder, mac: boolean): void {
+    this.dispatch(pass, 'advect_u', this.bind.uFwd, this.nx + 1, this.ny);
+    this.dispatch(pass, 'advect_v', this.bind.vFwd, this.nx, this.ny + 1);
+    if (mac) {
+      this.dispatch(pass, 'correct_u', this.bind.uCor, this.nx + 1, this.ny);
+      this.dispatch(pass, 'correct_v', this.bind.vCor, this.nx, this.ny + 1);
+    }
+  }
+
+  /** The dye dispatches — one for all three channels: they share the
+   *  backtrace. Result in dyeA (semiLagrangian) or dyeB (macCormack). */
+  recordDye(pass: GPUComputePassEncoder, mac: boolean): void {
+    this.dispatch(pass, 'advect_dye', this.bind.dFwd, this.nx, this.ny);
+    if (mac) this.dispatch(pass, 'correct_dye', this.bind.dCor, this.nx, this.ny);
   }
 
   /** Bounds-guarded in the shader, so overshooting the field is safe. */
@@ -321,7 +342,7 @@ export class GpuAdvector implements Advector {
     pass.dispatchWorkgroups(ceilDiv(width, WORKGROUP), ceilDiv(height, WORKGROUP));
   }
 
-  private writeParams(dt: number): void {
+  writeParams(dt: number): void {
     this.paramsU32[0] = this.nx;
     this.paramsU32[1] = this.ny;
     this.paramsF32[2] = this.h;
