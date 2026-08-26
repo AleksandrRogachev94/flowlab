@@ -383,4 +383,18 @@ export class GpuMultigridSolver implements PressureSolver {
     this.queryRead.unmap();
     return delta > 0n ? Number(delta) / 1e6 : NaN;
   }
+
+  /** Frees the level stack and the readback buffer — see GpuAdvector.destroy. */
+  destroy(): void {
+    for (const lv of this.levels) {
+      lv.x.destroy();
+      lv.b.destroy();
+      lv.r.destroy();
+      lv.label.destroy();
+    }
+    this.readBuf.destroy();
+    this.queryResolve?.destroy();
+    this.queryRead?.destroy();
+    this.querySet?.destroy();
+  }
 }

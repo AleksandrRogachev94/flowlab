@@ -354,4 +354,13 @@ export class GpuStepper implements GpuStep {
     this.queryRead.unmap();
     return delta > 0n ? Number(delta) / 1e6 : NaN;
   }
+
+  /** See GpuAdvector.destroy. This class owns no field buffers — the advector
+   *  and the solver it composes own theirs, and destroy their own. */
+  destroy(): void {
+    this.paramsBuf.destroy();
+    this.queryResolve?.destroy();
+    this.queryRead?.destroy();
+    this.querySet?.destroy();
+  }
 }

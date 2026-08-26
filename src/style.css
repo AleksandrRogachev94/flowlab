@@ -1,119 +1,392 @@
+/* Two typefaces doing two jobs: a UI sans for anything you click, and a
+   monospace for anything you read as a NUMBER. The panels used to be
+   monospace throughout, which is what made the thing look like a debug
+   harness — and it cost the readouts their distinctness at the same time. */
 :root {
   color-scheme: dark;
-  --bg: #0e1013;
-  --panel: #171a20;
-  --line: #272c35;
-  --text: #d8dde5;
-  --dim: #7d8797;
+
+  --ui-font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --mono-font: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --bg: #05060a;
+  --text: #eef1f6;
+  --dim: #98a1b2;
+  --faint: #6b7484;
+  /* Panels sit ON the flow, so they are translucent and blurred rather than
+     opaque: the picture stays the subject and the chrome reads as glass. */
+  --glass: rgba(14, 17, 24, 0.82);
+  --glass-solid: rgba(14, 17, 24, 0.94);
+  --line: rgba(255, 255, 255, 0.11);
+  --line-strong: rgba(255, 255, 255, 0.22);
+  --accent: #67e8f9;
+  --accent-ink: #04121a;
 }
+
 * {
   box-sizing: border-box;
 }
+
+html,
+body {
+  height: 100%;
+}
+
 body {
   margin: 0;
-  font:
-    13px/1.5 ui-monospace,
-    SFMono-Regular,
-    Menlo,
-    monospace;
+  overflow: hidden;
   background: var(--bg);
   color: var(--text);
+  font: 13px/1.5 var(--ui-font);
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Full viewport, three rows: header / stage / readout. The stage takes all
-   remaining height, and main.ts fits the canvas inside whatever that is —
-   so there is no hard-coded chrome height to drift out of date. */
-main {
-  height: 100vh;
-  overflow: hidden;
-  padding: 14px 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-header {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-h1 {
-  font-size: 13px;
-  font-weight: 600;
-  margin: 0;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--dim);
-}
-
-#stage {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-}
-canvas {
-  position: absolute;
+/* Full viewport, no letterbox: main.ts picks the GRID to match this box's
+   aspect, so the simulation domain and the window are the same shape and the
+   canvas can simply fill it. */
+#view {
+  position: fixed;
   inset: 0;
-  margin: auto;
-  border: 1px solid var(--line);
-  border-radius: 6px;
+  width: 100%;
+  height: 100%;
+  display: block;
   background: #000;
 }
 
-.controls {
+/* The chrome layer. Transparent to the pointer so a click lands on the canvas
+   unless it hits an actual control. */
+#ui {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+#ui button,
+#ui select,
+#ui input,
+#ui summary,
+#ui .panel {
+  pointer-events: auto;
+}
+
+/* ---------------------------------------------------------------- top bar */
+
+/* A scrim, not a bar: a gradient to black at the very top keeps white text
+   legible over a bright frame without drawing an edge across the picture. */
+.topbar {
+  position: absolute;
+  inset: 0 0 auto 0;
   display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 16px 18px 40px;
+  /* Three stops, not two: a linear fade is already half gone by the time it
+     reaches the blurb, which is the line most likely to sit over a bright
+     frame. The extra stop holds the scrim dark past the text. */
+  background: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.85),
+    rgba(0, 0, 0, 0.6) 55%,
+    rgba(0, 0, 0, 0)
+  );
+}
+
+.brand {
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.topbar-right {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* The scene switcher. Big enough to be the first thing you notice, because
+   switching scenes is what this demo is for. */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
-button {
-  font: inherit;
+.chips button {
+  font: 500 13px/1 var(--ui-font);
   color: var(--text);
-  background: var(--panel);
+  background: var(--glass);
+  backdrop-filter: blur(12px);
   border: 1px solid var(--line);
-  border-radius: 5px;
-  padding: 5px 11px;
+  border-radius: 999px;
+  padding: 8px 15px;
+  cursor: pointer;
+  transition:
+    background 120ms,
+    border-color 120ms,
+    color 120ms;
+}
+.chips button:hover {
+  border-color: var(--line-strong);
+  background: var(--glass-solid);
+}
+.chips button[aria-pressed='true'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+button.ghost {
+  font: 500 12px/1 var(--ui-font);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  background: var(--glass);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 11px;
   cursor: pointer;
 }
-button:hover {
-  background: #202530;
-  border-color: #3a4250;
+button.ghost:hover {
+  border-color: var(--line-strong);
+  background: var(--glass-solid);
 }
-/* Fixed two lines, and never allowed to shrink — the stage above it is what
-   gives way when the window is short, not the numbers. */
-#readout {
-  margin: 0;
-  flex: none;
-  height: 2.8em;
+
+/* One sentence of plain English about the current scene, under the chips.
+   The only text on screen aimed at someone who does not already know what a
+   vortex street is. */
+.blurb {
+  position: absolute;
+  top: 58px;
+  left: 18px;
+  right: 300px;
+  max-width: 56ch;
   color: var(--dim);
-  white-space: pre;
+  font-size: 12.5px;
+  /* Both readouts sit directly on the picture, and the picture can be any
+     colour at all. A shadow is what keeps them legible over a bright frame
+     without putting a box around them. */
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.9);
+}
+
+/* ------------------------------------------------------------------ panel */
+
+.panel {
+  position: absolute;
+  top: 62px;
+  right: 16px;
+  width: 264px;
+  max-height: calc(100% - 110px);
+  overflow-y: auto;
+  padding: 4px 16px 16px;
+  background: var(--glass);
+  backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+  /* Closed by default is tidier but undiscoverable; main.ts opens it on load
+     and `C` (or the button) hides it for a clean screenshot. */
+  display: none;
+}
+.panel.open {
+  display: block;
+}
+
+.panel section,
+.panel .advanced {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.panel .advanced {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* label + control, stacked. Stacked and not side by side: the labels here are
+   words ("Pressure solver"), and a 264px panel cannot give both halves room. */
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+.row:last-child {
+  margin-bottom: 0;
+}
+.row-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+  font-size: 12px;
+}
+.row.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.row.check .row-label {
+  color: var(--text);
+}
+
+.panel select {
+  font: 13px/1 var(--ui-font);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 9px;
+  width: 100%;
+  cursor: pointer;
+}
+.panel select:hover {
+  border-color: var(--line-strong);
+}
+.panel select:focus-visible,
+.panel button:focus-visible,
+.chips button:focus-visible,
+button.ghost:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input[type='checkbox'] {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+
+/* Mutually exclusive and few: one switch says that better than a dropdown. */
+.segmented {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
   overflow: hidden;
 }
+.segmented button {
+  flex: 1;
+  font: 500 12px/1 var(--ui-font);
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  padding: 8px 4px;
+  cursor: pointer;
+}
+.segmented button + button {
+  border-left: 1px solid var(--line);
+}
+.segmented button[aria-pressed='true'] {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.segmented button:disabled {
+  color: var(--faint);
+  cursor: not-allowed;
+  text-decoration: line-through;
+}
 
-/* Perf overlay — floats over the canvas inside #stage, which is the
-   positioned ancestor. pointer-events: none so it never intercepts a click
-   meant for the canvas (mouse interaction lands there later).
+.note {
+  margin: 8px 0 12px;
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.45;
+}
 
-   It is a <pre>, so the columns and the text bars align with no layout rules
-   at all — see viz/perfOverlay.ts. */
+.advanced summary {
+  cursor: pointer;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 4px 0 10px;
+  list-style: none;
+}
+.advanced summary::marker,
+.advanced summary::-webkit-details-marker {
+  display: none;
+}
+.advanced summary::after {
+  content: ' +';
+}
+.advanced[open] summary::after {
+  content: ' –';
+}
+
+kbd {
+  font: 10px/1 var(--mono-font);
+  color: var(--faint);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 4px;
+}
+
+/* -------------------------------------------------------------- readouts */
+
+/* Numbers, so monospace and tabular — otherwise every repaint shifts the
+   columns as digits change. */
+.hud {
+  position: absolute;
+  inset: auto auto 0 0;
+  max-width: 100%;
+  padding: 24px 18px 14px;
+  font: 11.5px/1.6 var(--mono-font);
+  font-variant-numeric: tabular-nums;
+  color: var(--dim);
+  white-space: pre;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.9);
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0.5) 55%, rgba(0, 0, 0, 0));
+}
+
+/* The perf overlay is a <pre> written by viz/perfOverlay.ts — its columns and
+   bars are text, so it needs no layout rules, only a place to sit. Below the
+   top scrim on the left, where nothing else lives. */
 .perf {
   position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 2;
-  pointer-events: none;
+  top: 92px;
+  left: 18px;
   margin: 0;
-  font:
-    11px/1.45 ui-monospace,
-    SFMono-Regular,
-    Menlo,
-    monospace;
-  color: var(--text);
-  background: rgba(12, 14, 19, 0.82);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 8px 10px;
-  /* Tabular figures, or every repaint shifts the columns as digits change. */
+  padding: 10px 12px;
+  font: 11px/1.45 var(--mono-font);
   font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: var(--glass-solid);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  backdrop-filter: blur(12px);
 }
 .perf[hidden] {
   display: none;
+}
+
+/* Under ~860px the top bar's three groups stop fitting on one line. Let them
+   wrap and get out of the picture's way. */
+@media (max-width: 860px) {
+  .topbar {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .topbar-right {
+    order: -1;
+  }
+  .blurb {
+    display: none;
+  }
+  .panel {
+    top: auto;
+    bottom: 56px;
+    max-height: 55%;
+  }
 }

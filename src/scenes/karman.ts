@@ -15,6 +15,10 @@
  * the effective Re is whatever semi-Lagrangian dissipation makes it — set by
  * RESOLUTION, not by any knob. Expect a plausible street; do not expect a
  * trustworthy Strouhal number until real viscosity exists.
+ *
+ * Geometry+velocity and dye are two separate exports. They share the cylinder
+ * sizing through `defaultKarman`, but nothing else: a scene is a flow, and
+ * which tracer rides it is the viewer's choice (see scenes/catalog.ts).
  */
 
 import { idxP, type Grid } from '../core/grid.ts';
@@ -40,27 +44,31 @@ export const defaultKarman: KarmanOptions = {
 };
 
 /**
- * Takes the grid because the symmetry-breaking offset is measured in cells —
- * the one length here that cannot be resolution-independent.
+ * Cylinder centre height: a QUARTER cell off the channel axis, and the
+ * fraction matters.
+ *
+ * Shedding is an instability: it amplifies an asymmetry, it does not create
+ * one. Everything else here is symmetric about the axis — inflow, walls, and
+ * the sweep-direction cycling in solvePressure, which was made symmetric on
+ * purpose — so a symmetric wake stays symmetric until roundoff grows, which
+ * can take longer than anyone watches.
+ *
+ * Half a cell would NOT do it. The disk is rasterized by cell centres at
+ * y = (j + 0.5)h, so a disk on the axis and one shifted by exactly h/2 both
+ * land symmetrically: one straddling a row, the other centred on it. A
+ * quarter cell makes the top and bottom staircases genuinely different.
+ *
+ * Takes the grid because this is the one length here that cannot be
+ * resolution-independent. The dye bands read it too, so they stay centred on
+ * the body at any resolution.
  */
-export function karmanChannel(g: Grid, options: Partial<KarmanOptions> = {}): SceneSpec {
-  const { speed, diameter, cx, depthCells } = { ...defaultKarman, ...options };
+function centreY(g: Grid): number {
+  return 0.5 + 0.25 * g.h;
+}
 
-  /**
-   * A QUARTER cell off the channel axis, and the fraction matters.
-   *
-   * Shedding is an instability: it amplifies an asymmetry, it does not create
-   * one. Everything else here is symmetric about the axis — inflow, walls, and
-   * the sweep-direction cycling in solvePressure, which was made symmetric on
-   * purpose — so a symmetric wake stays symmetric until roundoff grows, which
-   * can take longer than anyone watches.
-   *
-   * Half a cell would NOT do it. The disk is rasterized by cell centres at
-   * y = (j + 0.5)h, so a disk on the axis and one shifted by exactly h/2 both
-   * land symmetrically: one straddling a row, the other centred on it. A
-   * quarter cell makes the top and bottom staircases genuinely different.
-   */
-  const cy = 0.5 + 0.25 * g.h;
+/** Cylinder, outlet and free stream. No dye — see karmanBands. */
+export function karmanChannel(g: Grid, options: Partial<KarmanOptions> = {}): SceneSpec {
+  const { speed, diameter, cx } = { ...defaultKarman, ...options };
 
   /**
    * Uniform through-flow everywhere, walls included — an exact steady solution
@@ -71,43 +79,62 @@ export function karmanChannel(g: Grid, options: Partial<KarmanOptions> = {}): Sc
    */
   const seed: Seed = (_g, u) => u.fill(speed);
 
-  /**
-   * Three horizontal dye bands at the inlet, centred on the cylinder —
-   * streaklines. Each enters straight and the roll-up shears them past each
-   * other, so alternating vortices read as alternating colour instead of a grey
-   * blur.
-   *
-   * The band edges line up with the BODY, not with equal thirds. The middle
-   * band is exactly one diameter wide, so it is precisely the stream tube the
-   * cylinder splits — the fluid that becomes both shear layers and both
-   * families of vortex cores. The outer bands are half a diameter each and
-   * carry fluid that passes above or below without ever touching it. Under
-   * equal thirds every colour was a MIXTURE of the two populations, which is
-   * what made the middle band read as merely "thin".
-   *
-   * It stays thin either way, and that is physics, not a defect: the flux
-   * between two streamlines is conserved, so a material band's width goes as
-   * 1/speed. The stagnation tube necessarily narrows as it accelerates around
-   * the shoulder, then gets wound into the cores. Total span is 2D — much
-   * wider and the outer bands sail past the wake without entering it.
-   */
-  const dyeSource: DyeSource = (gg, dye) => {
+  return {
+    labels: allLabels(openRight(), solidDisk(cx, centreY(g), 0.5 * diameter)),
+    seed,
+  };
+}
+
+/**
+ * Three horizontal dye bands at the inlet, centred on the cylinder —
+ * streaklines. Each enters straight and the roll-up shears them past each
+ * other, so alternating vortices read as alternating colour instead of a grey
+ * blur.
+ *
+ * The band edges line up with the BODY, not with equal thirds. The middle
+ * band is exactly one diameter wide, so it is precisely the stream tube the
+ * cylinder splits — the fluid that becomes both shear layers and both
+ * families of vortex cores. The outer bands are half a diameter each and
+ * carry fluid that passes above or below without ever touching it. Under
+ * equal thirds every colour was a MIXTURE of the two populations, which is
+ * what made the middle band read as merely "thin".
+ *
+ * It stays thin either way, and that is physics, not a defect: the flux
+ * between two streamlines is conserved, so a material band's width goes as
+ * 1/speed. The stagnation tube necessarily narrows as it accelerates around
+ * the shoulder, then gets wound into the cores. Total span is 2D — much
+ * wider and the outer bands sail past the wake without entering it.
+ *
+ * EVERY ROW of the inlet columns is written, including the clean fluid outside
+ * the bands, and skipping those rows was a real bug rather than an
+ * optimisation. The whole left edge is inflow here, so "clean fluid arrives
+ * outside the bands" is a boundary condition and has to be imposed like one.
+ * Leaving those cells unwritten instead made them free: the backtrace at i = 0
+ * clamps to the domain edge, so an inlet cell effectively copies itself, and
+ * whatever dye reached it by the shedding's vertical velocity and by numerical
+ * diffusion was then RETAINED and re-copied every step. Measured on the wake:
+ * the dyed fraction of the inlet column climbed 26% -> 56% over 90 s with no
+ * sign of stopping, and total dye in the domain grew with it — a dyed strip
+ * spreading along the inlet, feeding the whole channel. That is what made the
+ * bands look like they were stretching further and further vertically.
+ */
+export function karmanBands(g: Grid, options: Partial<KarmanOptions> = {}): DyeSource {
+  const { diameter, depthCells } = { ...defaultKarman, ...options };
+  const cy = centreY(g);
+
+  return (gg, dye) => {
     const depth = Math.min(depthCells, gg.nx);
     for (let j = 0; j < gg.ny; j++) {
       const d = (j + 0.5) * gg.h - cy;
-      if (Math.abs(d) >= diameter) continue;
-      // Below / the body's own tube / above. Assumes the three RGB channels.
-      const band = Math.abs(d) < 0.5 * diameter ? 1 : d < 0 ? 0 : 2;
+      const inBand = Math.abs(d) < diameter;
+      // Below / the body's own tube / above, and -1 for the clean fluid
+      // outside — which selects no channel, so all three get 0. Assumes the
+      // three RGB channels.
+      const band = inBand ? (Math.abs(d) < 0.5 * diameter ? 1 : d < 0 ? 0 : 2) : -1;
       for (let i = 0; i < depth; i++) {
         const k = idxP(gg, i, j);
         for (let c = 0; c < dye.length; c++) dye[c][k] = c === band ? 1 : 0;
       }
     }
-  };
-
-  return {
-    labels: allLabels(openRight(), solidDisk(cx, cy, 0.5 * diameter)),
-    seed,
-    dyeSource,
   };
 }

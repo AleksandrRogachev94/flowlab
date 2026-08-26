@@ -140,7 +140,7 @@ export class PerfOverlay {
   private lastPaint = 0;
   private lastFrame = 0;
   /** Smoothed wall time between update() calls — the only thing measured here. */
-  private frameMs = 0;
+  private frameMs_ = 0;
 
   constructor(host: HTMLElement) {
     this.el = document.createElement('pre');
@@ -149,8 +149,15 @@ export class PerfOverlay {
     host.append(this.el);
   }
 
-  toggle(): void {
-    this.el.hidden = !this.el.hidden;
+  setVisible(visible: boolean): void {
+    this.el.hidden = !visible;
+  }
+
+  /** Smoothed wall time between frames, in ms. Exposed because the status line
+   *  wants the frame rate too, and measuring it twice would be two different
+   *  answers to the same question. */
+  get frameMs(): number {
+    return this.frameMs_;
   }
 
   /** Call every frame; it decides for itself whether to repaint. */
@@ -158,12 +165,12 @@ export class PerfOverlay {
     // Before the hidden check, so the frame rate is already warm the moment
     // the panel is switched on rather than climbing from zero for a second.
     const now = performance.now();
-    if (this.lastFrame > 0) this.frameMs = smooth(this.frameMs, now - this.lastFrame);
+    if (this.lastFrame > 0) this.frameMs_ = smooth(this.frameMs_, now - this.lastFrame);
     this.lastFrame = now;
 
     if (this.el.hidden) return;
     if (now - this.lastPaint < 1000 / PAINT_HZ) return;
     this.lastPaint = now;
-    this.el.textContent = formatPanel(u, this.frameMs);
+    this.el.textContent = formatPanel(u, this.frameMs_);
   }
 }

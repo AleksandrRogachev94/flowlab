@@ -6,17 +6,19 @@ Structure grows as needed; see `PLAN.md` for the actual roadmap.
 
 ## Stack
 
-- **Vite + TypeScript, no framework.** The UI is a canvas and a handful of
-  sliders; a component tree buys nothing and would put simulation state on
-  the wrong clock. Vite is here mainly for Phase 2: `import s from './x.wgsl?raw'`
-  works with zero config.
+- **Vite + TypeScript, no framework.** The UI is a full-bleed canvas with a
+  scene switcher and one settings panel over it (`src/ui/controls.ts`, built
+  from plain DOM); a component tree buys nothing and would put simulation
+  state on the wrong clock. Vite is here mainly for Phase 2:
+  `import s from './x.wgsl?raw'` works with zero config.
 - **Tests: `node --test`, no test framework.** Node 24 strips TS types
   natively, so `.test.ts` files run directly. Zero dependencies.
   `*.gputest.ts` is the second tier — see Rule 7 — run by `npm run test:gpu`
   and kept out of `npm test` so the fast suite stays a one-second run with no
   browser.
-- **Total dependencies: TypeScript, Vite, `@webgpu/types`.** Plus `lil-gui`
-  when sliders arrive.
+- **Total dependencies: TypeScript, Vite, `@webgpu/types`.** The settings
+  panel is ~250 lines of DOM built from option lists, which is less than
+  wiring a widget library to the same lists would have been.
 
 ## Rule 1 — `src/core/` never touches the DOM
 
@@ -96,15 +98,25 @@ test is the difference between an obvious bug and a subtle one.
 ## Rule 5 — one seam between CPU and GPU: the solver interface
 
 `PressureSolver` in `src/core/pressureSolver.ts` is the _only_ place the two
-implementations meet. Three of them exist and `G` cycles between them:
+implementations meet. Five of them exist, and the UI reaches them through an
+ENGINE (`G`) that picks advector and solver family together:
 
-| solver      | ordering      | precision | where |
-| ----------- | ------------- | --------- | ----- |
-| `cpu-sor`   | lexicographic | float64   | CPU   |
-| `cpu-rbsor` | red-black     | float64   | CPU   |
-| `gpu-rbsor` | red-black     | float32   | WGSL  |
+| engine | solver      | ordering      | precision | where |
+| ------ | ----------- | ------------- | --------- | ----- |
+| CPU    | `cpu-mg`    | multigrid     | float64   | CPU   |
+| CPU    | `cpu-rbsor` | red-black     | float64   | CPU   |
+| CPU    | `cpu-sor`   | lexicographic | float64   | CPU   |
+| GPU    | `gpu-mg`    | multigrid     | float32   | WGSL  |
+| GPU    | `gpu-rbsor` | red-black     | float32   | WGSL  |
 
-The middle row looks redundant and is the most useful of the three. Without
+The engine gate is not cosmetic. A GPU advector against a CPU solver (or the
+reverse) pays a full round trip per frame that neither pure configuration
+does, so its timing describes the seam and not either implementation. Within
+one engine the choice is still one variable at a time — ordering, then
+algorithm — and both engines offer the same two rungs, which is what keeps
+CPU-vs-GPU controlled.
+
+`cpu-rbsor` looks redundant and is the most useful row in the table. Without
 it, a wrong GPU picture has three candidate causes at once — ordering,
 precision, plumbing — and no way to separate them. With it, "CPU red-black
 disagrees too" means the algorithm, and "only the GPU disagrees" means the
@@ -158,6 +170,26 @@ The grid allocator takes the typed-array constructor as a parameter.
 PLAN.md §8 compares CPU float64 against GPU float32 while _also_ changing
 the solver; injecting the constructor makes float32-on-CPU a one-line run,
 which separates the precision variable from the convergence variable.
+
+## Rule 9 — the browser changes structure at frame boundaries, never in a handler
+
+A GPU step spends most of its duration `await`ing a readback. Anything that
+resets or reallocates fields from an event handler therefore lands INSIDE a
+step: the device's answer, computed from the old scene or into the old
+buffers, is written over the new state the moment the readback resolves. That
+is what made switching scene or dye leave two scenes composited on screen.
+
+So `src/main.ts` sets `pendingRestart` / `pendingRebuild` and drains them at
+the top of `frame()`, between a completed step and the next one. The same
+rule is what makes it safe to `destroy()` GPU buffers on a resolution change:
+no submit is in flight there.
+
+Related, and the reason the old scene/tracer confusion is gone: a scene owns
+its list of meaningful dyes (`src/scenes/catalog.ts`). Tracers and flows are
+not freely combinable — a seeded tracer washes out of a channel with an
+outlet, and a re-stamped one needs an inflow to be stamped into — so the flow
+carries the list instead of a compatibility table sitting between two
+independent cycles.
 
 ## Deployment
 

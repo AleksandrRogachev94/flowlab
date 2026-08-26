@@ -349,4 +349,35 @@ export class GpuAdvector implements Advector {
     this.paramsF32[3] = dt;
     this.device.queue.writeBuffer(this.paramsBuf, 0, this.paramsData);
   }
+
+  /**
+   * Releases the device memory this advector owns.
+   *
+   * Called when the GRID changes: a resolution switch builds a fresh set of
+   * these objects, and at 1600x900 one set is tens of megabytes of storage
+   * buffers. Waiting for the collector to notice a GPUBuffer is not a plan
+   * when a viewer can flip resolution a dozen times in a session.
+   *
+   * The uniform buffers are deliberately left out here and in the classes
+   * below: they are 32 bytes each, so listing them costs more code than the
+   * leak does memory. Pipelines and bind groups are not destroyable at all —
+   * they hold no allocation worth the API.
+   */
+  destroy(): void {
+    const owned = [
+      this.uIn,
+      this.vIn,
+      this.dyeIn,
+      this.labelBuf,
+      this.uA,
+      this.uB,
+      this.vA,
+      this.vB,
+      this.dyeA,
+      this.dyeB,
+      this.velRead,
+      this.dyeRead,
+    ];
+    for (const b of owned) b.destroy();
+  }
 }

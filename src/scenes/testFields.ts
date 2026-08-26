@@ -138,13 +138,24 @@ export function addDyeStripes(g: Grid, dye: FieldArray[], periodCells = 12): voi
 }
 
 /**
- * One channel's value at row j: a bright band times a hue.
+ * One channel's value at row j: a bright band times a colour.
  *
- * Two independent periods, and keeping them apart is the whole design.
+ * `tint` replaces the hue ramp with one fixed colour, which turns the same
+ * pattern into a monochrome streakline picture — the smoke-wire photograph a
+ * wind tunnel takes of a vortex street. It is a different instrument, not a
+ * prettier one: the hue ramp LABELS each band so you can follow a particular
+ * one through a wake, while a single colour gives up the labelling and buys
+ * back contrast, since every band is then at full brightness instead of at
+ * whatever its point on the ramp allows.
  *
- *   BRIGHTNESS cycles every `periodCells` — many thin bands, squared so they
+ * With the ramp, two independent periods, and keeping them apart is the whole
+ * design.
+ *
+ *   BRIGHTNESS cycles every `periodCells`, raised to `sharpness` so the bands
  *   are narrow bright lines with dark gaps rather than a continuous wash. The
- *   gaps are what let the eye follow ONE line through a vortex.
+ *   gaps are what let the eye follow ONE line through a vortex, and raising
+ *   the exponent trades ribbon width for gap: 1 is a wash, 2 a soft ribbon,
+ *   4-6 a distinct filament with black either side.
  *
  *   HUE cycles ONCE over the domain height, via the three channels offset by a
  *   third of a cycle: red at the bottom, through green, to blue at the top.
@@ -163,13 +174,56 @@ export function addDyeStripes(g: Grid, dye: FieldArray[], periodCells = 12): voi
  */
 function stripeAt(g: Grid, j: number, periodCells: number, c: number, channels: number): number {
   const band = 0.5 + 0.5 * Math.cos((2 * Math.PI * j) / periodCells);
-  const hue = 0.5 + 0.5 * Math.cos(2 * Math.PI * (j / g.ny - c / channels));
-  return band * band * hue;
+  return band * band * hueAt(g, j, c, channels);
 }
 
 /**
- * addDyeStripes as a SOURCE — the same pattern re-stamped in the inlet columns
- * every step, so bands keep arriving instead of washing out once.
+ * A cyclic colour ramp over the domain HEIGHT, built from the three channels
+ * offset by a third of a cycle: red at the bottom, through green, to blue at
+ * the top. Shared by both tracers below, which is the point of it being its
+ * own function — the ramp is a labelling scheme, independent of whatever
+ * profile is being labelled.
+ */
+function hueAt(g: Grid, j: number, c: number, channels: number): number {
+  return 0.5 + 0.5 * Math.cos(2 * Math.PI * (j / g.ny - c / channels));
+}
+
+/**
+ * STREAKLINE profile: 1 inside the ribbon, 0 in the gap, with a one-cell
+ * smoothstep at each edge. A different instrument from stripeAt's raised
+ * cosine, and the difference is the whole reason both exist.
+ *
+ * A cosine has no edge anywhere in it — every point of the band is a gradient,
+ * so a fold in the band is a smudge, and raising the exponent only narrows the
+ * bump without ever producing a boundary. A smoke filament is defined by its
+ * EDGES: they are material lines, and watching them fold is the entire
+ * measurement. So this is a top hat, and the ramp is one cell for exactly the
+ * reason addDyeDisk gives — a hard step aliases at the grid scale, while one
+ * cell of ramp is narrow enough that the blur you then watch grow downstream is
+ * genuinely the advection scheme's rather than the seed's.
+ *
+ * `duty` is the fraction of the period that is bright, so spacing and thickness
+ * are independent knobs. A real smoke rake runs about a third.
+ */
+function ribbonAt(g: Grid, j: number, periodCells: number, duty: number): number {
+  const phase = ((j % periodCells) + periodCells) % periodCells;
+  // Distance to the nearest line centre (centres sit at multiples of the
+  // period), so one expression covers both edges of every ribbon.
+  const d = Math.min(phase, periodCells - phase);
+  const half = 0.5 * duty * periodCells;
+  // t crosses 0.5 exactly at the ribbon edge, so the ramp straddles it.
+  const t = Math.min(Math.max(half - d + 0.5, 0), 1);
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Streaklines re-stamped in the inlet columns every step, so lines keep
+ * arriving instead of washing out once — the wind tunnel's smoke rake.
+ *
+ * It is addDyeStripes' sibling rather than its source form: same idea, sharper
+ * profile, because a tracer released at a boundary and watched downstream is
+ * asking about its own edges (ribbonAt) while one seeded across a closed box is
+ * asking about spacing (stripeAt).
  *
  * A seeded tracer is a transient in any scene with an outlet: every dyed
  * particle leaves within one domain transit and nothing replaces it. That is
@@ -181,12 +235,33 @@ function stripeAt(g: Grid, j: number, periodCells: number, c: number, channels: 
  * pins dye against it with no flow to carry it away. main.ts gates this on
  * SceneDef.inflow rather than guessing.
  */
-export function stripeInflow(periodCells = 12, depthCells = 2): DyeSource {
+export interface StripeOptions {
+  /** Line spacing, in cells. */
+  periodCells?: number;
+  /** Fraction of the period that is bright — see ribbonAt. */
+  duty?: number;
+  /** Source thickness, in cells inward from the inlet. */
+  depthCells?: number;
+  /**
+   * One fixed colour for every line instead of the height hue ramp. Two
+   * different instruments: the ramp LABELS each line, so you can follow one
+   * particular filament through a wake, while a single colour gives up the
+   * labelling and buys back contrast, every line being at full brightness
+   * rather than at whatever its point on the ramp allows.
+   */
+  tint?: readonly number[];
+}
+
+/** An options object rather than four positional arguments: three of them are
+ *  all "how the line looks", and at a call site `2, 0.4, SMOKE` says nothing. */
+export function stripeInflow(options: StripeOptions = {}): DyeSource {
+  const { periodCells = 12, duty = 0.4, depthCells = 2, tint } = options;
   return (g, dye) => {
     const depth = Math.min(depthCells, g.nx);
     for (let j = 0; j < g.ny; j++) {
+      const ribbon = ribbonAt(g, j, periodCells, duty);
       for (let c = 0; c < dye.length; c++) {
-        const v = stripeAt(g, j, periodCells, c, dye.length);
+        const v = ribbon * (tint ? tint[c] : hueAt(g, j, c, dye.length));
         for (let i = 0; i < depth; i++) dye[c][idxP(g, i, j)] = v;
       }
     }

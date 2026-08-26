@@ -57,7 +57,15 @@ export class FieldView {
     this.solidsPath = null;
   }
 
-  draw(ctx: CanvasRenderingContext2D, sim: Simulation, view: View): ViewStats {
+  /**
+   * `arrows` is off by default because the picture is better without them:
+   * the dye and vorticity views already carry direction in their structure,
+   * and a full-screen grid of white arrows sits on top of exactly the
+   * filaments the scheme comparison is about. It stays available because
+   * direction is the one thing a scalar field genuinely cannot show — a
+   * recirculation bubble and a fast through-flow can render identically.
+   */
+  draw(ctx: CanvasRenderingContext2D, sim: Simulation, view: View, arrows = false): ViewStats {
     const { g, f, div } = sim;
 
     // FLUID cells only: an Air outlet is supposed to be divergent and a
@@ -144,21 +152,26 @@ export class FieldView {
 
     this.drawSolids(ctx, g, f.label);
 
-    // Device pixels per CSS pixel: the backing store is oversampled on a retina
-    // display, so every pixel length below must scale with it.
-    const dpr = ctx.canvas.width / (ctx.canvas.clientWidth || ctx.canvas.width);
+    if (arrows) {
+      // Device pixels per CSS pixel: the backing store is oversampled on a
+      // retina display, so every pixel length below must scale with it.
+      const dpr = ctx.canvas.width / (ctx.canvas.clientWidth || ctx.canvas.width);
 
-    // refSpeed matches the heatmap's per-frame normalization, so the picture
-    // shows structure while magnitude lives in the readout.
-    drawVectors(ctx, g, f.u, f.v, {
-      ...defaultVectorOptions,
-      spacingPx: 26 * dpr,
-      scale: 14 * dpr,
-      headSize: 3.5 * dpr,
-      lineWidth: dpr,
-      color: 'rgba(255, 255, 255, 0.62)',
-      refSpeed: maxSpeed,
-    });
+      // refSpeed matches the heatmap's per-frame normalization, so the picture
+      // shows structure while magnitude lives in the readout.
+      drawVectors(ctx, g, f.u, f.v, {
+        ...defaultVectorOptions,
+        // Wider and longer than they were while they were always-on: an
+        // optional overlay should be legible when you ask for it, and it no
+        // longer has to stay out of the way of every screenshot.
+        spacingPx: 34 * dpr,
+        scale: 20 * dpr,
+        headSize: 4.5 * dpr,
+        lineWidth: dpr,
+        color: 'rgba(255, 255, 255, 0.72)',
+        refSpeed: maxSpeed,
+      });
+    }
 
     return { maxSpeed, divMax, divRms };
   }

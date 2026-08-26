@@ -297,4 +297,15 @@ export class GpuPressureSolver implements PressureSolver {
     this.queryRead.unmap();
     return delta > 0n ? Number(delta) / 1e6 : NaN;
   }
+
+  /** See GpuAdvector.destroy. */
+  destroy(): void {
+    this.pBuf.destroy();
+    this.divBuf.destroy();
+    this.labelBuf.destroy();
+    this.readBuf.destroy();
+    this.queryResolve?.destroy();
+    this.queryRead?.destroy();
+    this.querySet?.destroy();
+  }
 }
