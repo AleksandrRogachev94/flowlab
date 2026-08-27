@@ -160,6 +160,10 @@ export interface SimulationParams {
    * 4: the readout is smoothed and redrawn at frame rate either way, and no
    * decision anywhere is made on a 60 Hz residual that a 15 Hz one would get
    * wrong. It is still computed from what actually came back from the device.
+   *
+   * 0 means NEVER, which is what the browser sets while the readout that
+   * displays it is off — the whole point of a diagnostic nothing reads is that
+   * it should not be computed.
    */
   residualEvery: number;
 }
@@ -376,6 +380,11 @@ export class Simulation {
     const dt = uMax > 1e-9 ? Math.min(p.dtMax, (p.cflTarget * g.h) / uMax) : p.dtMax;
     const scale = (p.rho * g.h * g.h) / dt;
     const gradScale = dt / (p.rho * g.h);
+    // Its own phase because it is not free and it used to hide inside whatever
+    // was marked next: maxFaceSpeed scans every face, which at 1920x1080 is
+    // ~4.2M reads and the largest host loop left in the frame now that the
+    // residual is off by default. A GPU reduction is the fix when it matters.
+    this.perf.mark('cfl');
 
     if (this.stepper) {
       // The fused path: one submit covers everything from here to the dye
@@ -385,7 +394,8 @@ export class Simulation {
       // number vouching for itself.
       const keep = p.dyeDecay > 0 ? Math.exp(-p.dyeDecay * dt) : 1;
       this.iters = await this.stepper.step(f, p.scheme, dt, scale, gradScale, keep, this.perf);
-      if (this.steps % p.residualEvery === 0) computeDivergence(g, f.u, f.v, this.div);
+      if (p.residualEvery > 0 && this.steps % p.residualEvery === 0)
+        computeDivergence(g, f.u, f.v, this.div);
       this.perf.mark('residual');
     } else {
       await this.advector.velocity(g, p.scheme, f.u, f.v, this.uNext, this.vNext, f.label, dt);
@@ -415,7 +425,8 @@ export class Simulation {
       this.perf.mark('gradient');
 
       // now the residual
-      if (this.steps % p.residualEvery === 0) computeDivergence(g, f.u, f.v, this.div);
+      if (p.residualEvery > 0 && this.steps % p.residualEvery === 0)
+        computeDivergence(g, f.u, f.v, this.div);
       this.perf.mark('residual');
 
       // Dye rides the PROJECTED velocity, which is why this sits after the

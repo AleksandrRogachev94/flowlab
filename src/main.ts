@@ -22,7 +22,7 @@ import {
   type UiState,
 } from './ui/controls.ts';
 import { DyeRenderer } from './viz/dyeGpu.ts';
-import { FieldView, VIEWS, type View } from './viz/fieldView.ts';
+import { divergenceStats, FieldView, VIEWS, type View } from './viz/fieldView.ts';
 import { PerfOverlay } from './viz/perfOverlay.ts';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#view')!;
@@ -320,6 +320,12 @@ function dyeScaleFor(ny: number): number {
   return Math.max(1, Math.min(2, Math.floor(rows / ny)));
 }
 
+/** 0 is "never" — the residual is a diagnostic, so it is not worth an
+ *  O(cells) host pass per 4 steps while the readout that shows it is off. */
+function residualEveryFor(): number {
+  return state.diagnostics ? 4 : 0;
+}
+
 /** Rows from the quality setting, columns from the window: the grid is the
  *  same shape as the viewport, so the canvas needs no letterbox. */
 function gridFor(quality: Quality): { nx: number; ny: number } {
@@ -391,7 +397,7 @@ function rebuild(): void {
       omega: PRESSURE_OMEGA,
       // A diagnostic, and the last O(cells) host loop in the frame — see
       // SimulationParams.residualEvery. The headless default stays 1.
-      residualEvery: 4,
+      residualEvery: residualEveryFor(),
     },
     Float32Array,
     dyeScaleFor(ny),
@@ -538,9 +544,14 @@ function apply(key: UiKey): void {
     case 'perf':
       overlay.setVisible(state.perf);
       break;
+    case 'diagnostics':
+      // Turning the readout on is what starts the residual being computed at
+      // all; leaving it off skips both that and the stats pass in the frame.
+      app.sim.params.residualEvery = residualEveryFor();
+      break;
     default:
-      // view, arrows and diagnostics are read by the draw and the status line
-      // every frame; there is nothing to install.
+      // view and arrows are read by the draw every frame; there is nothing to
+      // install.
       break;
   }
 }
@@ -704,13 +715,13 @@ async function frame(): Promise<void> {
   const dyeOnDevice = state.view === 'dye' && app.sim.stepper !== null && app.gpu !== null;
   dyeCanvas.hidden = !dyeOnDevice;
   if (dyeOnDevice) app.gpu!.dyeView.draw();
-  const { maxSpeed, divMax, divRms } = app.view.draw(
-    ctx,
-    app.sim,
-    state.view,
-    state.arrows,
-    dyeOnDevice,
-  );
+  const maxSpeed = app.view.draw(ctx, app.sim, state.view, state.arrows, dyeOnDevice);
+  // Only when something reads it: a full pass over every cell, and the status
+  // line drops it otherwise. Simulation stops refreshing `div` at all in that
+  // case — see residualEvery below.
+  const { divMax, divRms } = state.diagnostics
+    ? divergenceStats(app.sim, maxSpeed)
+    : { divMax: 0, divRms: 0 };
   drawPerf.mark('draw');
 
   controls.setHud(statusLine(maxSpeed, divMax, divRms));

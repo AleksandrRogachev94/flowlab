@@ -52,10 +52,20 @@ import projectSource from './project.wgsl?raw';
  * Air), bought in exchange for not threading a ping-pong flag through ten bind
  * groups; if it ever shows up in a profile, that is the trade to revisit.
  *
+ * THE READBACK RUNS A FRAME BEHIND. step() submits and returns; the map is
+ * awaited at the top of the NEXT step (drainReadback), not the bottom of its
+ * own. Awaiting it in place made the frame strictly serial — the device
+ * finished, then the host did its CFL scan and its draw with the device idle,
+ * then the next frame was submitted — which measured as ~4.8 ms of device work
+ * inside a 17.7 ms frame. Returning early lets the two overlap, and costs only
+ * that f.u/f.v are one step old (see drainReadback for why that is safe).
+ *
  * invalidate() is the escape hatch: reset(), or switching back from a CPU
  * solver, leaves the host holding truth, and the next step() starts by
  * uploading u, v, label, p and dye once. Labels also re-coarsen then, and ONLY
- * then — a static scene never re-runs the chain.
+ * then — a static scene never re-runs the chain. It also makes the next drain
+ * DISCARD whatever was in flight, which would otherwise overwrite the host's
+ * new fields with the device's old ones.
  */
 
 /** Must match @workgroup_size in project.wgsl. */
@@ -120,6 +130,18 @@ export class GpuStepper implements GpuStep {
    *  the first step is exactly the "host just changed everything" case. */
   private dirty = true;
   private busy = false;
+
+  /**
+   * LAST frame's readbacks, still in flight — the map is started right after
+   * the submit and awaited at the TOP of the next step, never at the bottom of
+   * its own. See "THE READBACK RUNS A FRAME BEHIND" in the class comment.
+   *
+   * Both or neither: they are started together and drained together, and the
+   * timestamps have to follow the velocity or reading them would reintroduce
+   * exactly the stall this removes.
+   */
+  private velMap: Promise<undefined> | null = null;
+  private timeMap: Promise<undefined> | null = null;
 
   constructor(
     private readonly ctx: GpuContext,
@@ -289,7 +311,15 @@ export class GpuStepper implements GpuStep {
       const { queue } = this.device;
       const { adv, mg } = this;
       const fine = mg.levels[0];
+
+      // Last frame's results first, and BEFORE the dirty upload below reads
+      // f.u/f.v — a drain that landed after it would overwrite exactly the
+      // host data the upload is there to send.
+      const tDrain = performance.now();
+      await this.drainReadback(f);
       const t0 = performance.now();
+      this.timings.wait = smooth(this.timings.wait, t0 - tDrain);
+      perf.mark('readback');
 
       if (this.dirty) {
         // The one full host -> device sync. Labels go up twice — the fine
@@ -382,24 +412,63 @@ export class GpuStepper implements GpuStep {
       queue.submit([encoder.finish()]);
       this.dirty = false;
 
-      await adv.velRead.mapAsync(GPUMapMode.READ);
+      // Started, NOT awaited: this is the whole optimization. The caller gets
+      // control back with the submit still executing, so the host's own frame
+      // work — the CFL scan, the draw — overlaps the device instead of
+      // queueing behind it. Drained at the top of the next step().
+      this.velMap = adv.velRead.mapAsync(GPUMapMode.READ);
+      this.timeMap = this.queryRead?.mapAsync(GPUMapMode.READ) ?? null;
       perf.mark('solve');
 
+      this.timings.upload = smooth(this.timings.upload, t1 - t0);
+      return mg.cycles;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /**
+   * Last frame's velocity and timestamps, copied into the host fields.
+   *
+   * Runs at the top of the next step rather than the bottom of its own, which
+   * is what lets the device work while the host does. By the time this is
+   * reached the submit has usually long since retired, so the await is
+   * typically free — `timings.wait` is what it actually cost, and it is the
+   * number to watch if this ever stops being true.
+   *
+   * ONE FRAME STALE, deliberately. f.u/f.v are the previous step's output, so
+   * the CFL bound they feed is one step behind. That is safe because the bound
+   * is a target rather than a limit — semi-Lagrangian advection is
+   * unconditionally stable, `cflTarget` is an accuracy knob (see
+   * SimulationParams), and a step's velocity cannot change enough in one frame
+   * to matter to it. The DEVICE's own copy is never stale: it advects from
+   * uIn/vIn, which it wrote itself.
+   */
+  private async drainReadback(f: Fields): Promise<void> {
+    if (!this.velMap) return;
+    const { adv } = this;
+    await Promise.all([this.velMap, this.timeMap]);
+    this.velMap = null;
+    this.timeMap = null;
+
+    // A reset or a CPU frame happened while this was in flight, so the host
+    // now holds truth and these numbers are from before it. Unmap and drop
+    // them — writing them into f.u/f.v would undo whatever the host just did.
+    if (!this.dirty) {
       // Copy out BEFORE unmap — unmap() detaches the ranges silently.
       const vel = adv.velRead.getMappedRange();
       f.u.set(new Float32Array(vel, 0, adv.uLen));
       f.v.set(new Float32Array(vel, adv.uBytes, adv.vLen));
-      adv.velRead.unmap();
-      perf.mark('readback');
+    }
+    adv.velRead.unmap();
 
-      this.timings.upload = smooth(this.timings.upload, t1 - t0);
-      this.timings.wait = smooth(this.timings.wait, performance.now() - t1);
-      const device = await this.readDeviceTime();
+    if (this.queryRead) {
+      const ns = new BigUint64Array(this.queryRead.getMappedRange());
+      const delta = ns[1] - ns[0];
+      this.queryRead.unmap();
+      const device = delta > 0n ? Number(delta) / 1e6 : NaN;
       this.hasDeviceTime = Number.isFinite(device);
       this.timings.device = smooth(this.timings.device, device);
-      return mg.cycles;
-    } finally {
-      this.busy = false;
     }
   }
 
@@ -461,19 +530,16 @@ export class GpuStepper implements GpuStep {
     this.device.queue.writeBuffer(this.dyeParamsBuf, 0, this.dyeParamsData);
   }
 
-  /** Same contract as GpuPressureSolver.readDeviceTime. */
-  private async readDeviceTime(): Promise<number> {
-    if (!this.queryRead) return NaN;
-    await this.queryRead.mapAsync(GPUMapMode.READ);
-    const ns = new BigUint64Array(this.queryRead.getMappedRange());
-    const delta = ns[1] - ns[0];
-    this.queryRead.unmap();
-    return delta > 0n ? Number(delta) / 1e6 : NaN;
-  }
-
   /** See GpuAdvector.destroy. The field buffers belong to the advector and the
    *  solver this composes; the patch buffer is this class's own. */
   destroy(): void {
+    // An in-flight map rejects when its buffer goes away, and a rejection
+    // nobody is awaiting is an unhandled one. Attaching the handler here is
+    // enough; the result is genuinely not wanted.
+    this.velMap?.catch(() => {});
+    this.timeMap?.catch(() => {});
+    this.velMap = null;
+    this.timeMap = null;
     this.paramsBuf.destroy();
     this.dyeParamsBuf.destroy();
     this.patchBuf?.destroy();

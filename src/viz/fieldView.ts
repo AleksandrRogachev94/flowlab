@@ -18,10 +18,8 @@ import { cellVelocity, defaultVectorOptions, drawVectors } from './vectors.ts';
 export const VIEWS = ['dye', 'vorticity', 'speed', 'divergence'] as const;
 export type View = (typeof VIEWS)[number];
 
-/** What the frame was normalized by. The picture is rescaled every frame, so
- *  only these numbers show decay and convergence. */
-export interface ViewStats {
-  maxSpeed: number;
+/** The solver's residual, summarized. */
+export interface DivStats {
   /** Worst single fluid cell. Reported, but NOT the headline: the extremes sit
    *  on the obstacle's staircase corners at ~1000x the median, so this number
    *  tracks the geometry rather than the state of the solve. */
@@ -32,6 +30,34 @@ export interface ViewStats {
    * resolutions and flow speeds, where the raw max is not.
    */
   divRms: number;
+}
+
+/**
+ * A DIAGNOSTIC, and a full pass over every cell — which is why it is its own
+ * function rather than something draw() computes on the way past.
+ *
+ * It used to run inside draw(), every frame, over a `div` that Simulation only
+ * refreshes every `residualEvery` steps, to produce numbers the status line
+ * discards unless the readout is on. At 2.12M cells that was a couple of ms a
+ * frame spent on nothing. main.ts now calls it only when something reads it.
+ */
+export function divergenceStats(sim: Simulation, maxSpeed: number): DivStats {
+  const { g, f, div } = sim;
+  // FLUID cells only: an Air outlet is supposed to be divergent and a solid's
+  // faces are frozen boundary data — either would blow out the stats with
+  // values nothing is solving for.
+  let divMax = 0;
+  let divSq = 0;
+  let fluidCells = 0;
+  for (let k = 0; k < div.length; k++) {
+    if (f.label[k] !== Cell.Fluid) continue;
+    const d = Math.abs(div[k]);
+    if (d > divMax) divMax = d;
+    divSq += d * d;
+    fluidCells++;
+  }
+  const divRms = fluidCells ? Math.sqrt(divSq / fluidCells) / ((maxSpeed || 1) / g.h) : 0;
+  return { divMax, divRms };
 }
 
 /** Renders a Simulation as a heatmap plus arrows. Owns its scratch buffers,
@@ -88,22 +114,8 @@ export class FieldView {
     view: View,
     arrows = false,
     dyeOnDevice = false,
-  ): ViewStats {
-    const { g, f, div } = sim;
-
-    // FLUID cells only: an Air outlet is supposed to be divergent and a
-    // solid's faces are frozen boundary data — either would blow out the
-    // stats with values nothing is solving for.
-    let divMax = 0;
-    let divSq = 0;
-    let fluidCells = 0;
-    for (let k = 0; k < div.length; k++) {
-      if (f.label[k] !== Cell.Fluid) continue;
-      const d = Math.abs(div[k]);
-      if (d > divMax) divMax = d;
-      divSq += d * d;
-      fluidCells++;
-    }
+  ): number {
+    const { g, f } = sim;
 
     // The cell-centred speed field is filled only for the view that shows it.
     // It used to be built every frame, and at 1920x1080 that one loop — 2M
@@ -126,8 +138,6 @@ export class FieldView {
     } else {
       maxSpeed = sim.maxFaceSpeed();
     }
-
-    const divRms = fluidCells ? Math.sqrt(divSq / fluidCells) / ((maxSpeed || 1) / g.h) : 0;
 
     if (view === 'vorticity') {
       computeVorticity(g, f.u, f.v, this.vort);
@@ -174,7 +184,7 @@ export class FieldView {
       // the cylinder's staircase corners. Scaling to it painted every other cell
       // at the ramp's neutral midpoint, i.e. a blank frame with three specks —
       // hiding exactly the interior residual this view exists to show.
-      this.heatmap.draw(div, ctx, {
+      this.heatmap.draw(sim.div, ctx, {
         normalization: { kind: 'percentile', p: 0.99 },
         colormap: coolwarm,
       });
@@ -203,7 +213,7 @@ export class FieldView {
       });
     }
 
-    return { maxSpeed, divMax, divRms };
+    return maxSpeed;
   }
 
   /**
