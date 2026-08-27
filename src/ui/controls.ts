@@ -33,6 +33,9 @@ export interface UiState {
   quality: Quality;
   perf: boolean;
   diagnostics: boolean;
+  /** The scene blurb. Closable because it sits over the picture and, once
+   *  read, is the one piece of chrome with nothing left to say. */
+  help: boolean;
 }
 
 export type UiKey = keyof UiState;
@@ -110,11 +113,17 @@ export class Controls {
   private readonly panel: HTMLElement;
   private readonly panelButton: HTMLButtonElement;
   private readonly blurb: HTMLElement;
+  private readonly blurbText: HTMLElement;
   private readonly hudEl: HTMLElement;
   private readonly scenes: SceneOption[];
 
   constructor(
     host: HTMLElement,
+    /** Where the blurb mounts — a separate element from `host` so main.ts can
+     *  stack it with the perf panel in normal document flow instead of two
+     *  independent absolute positions that overlap once the blurb grows past
+     *  one line (see style.css's .left-stack). */
+    blurbHost: HTMLElement,
     private readonly state: UiState,
     spec: ControlsSpec,
     private readonly onSet: Setter,
@@ -134,10 +143,19 @@ export class Controls {
     this.panelButton = el('button', 'ghost', 'Controls');
     this.panelButton.append(kbd('C'));
     this.panelButton.addEventListener('click', () => this.togglePanel());
-    right.append(restart, this.panelButton);
+    const helpButton = el('button', 'ghost', 'About');
+    helpButton.append(kbd('H'));
+    helpButton.addEventListener('click', () => this.onSet('help', !this.state.help));
+    right.append(restart, helpButton, this.panelButton);
     bar.append(right);
 
     this.blurb = el('div', 'blurb');
+    const closeBlurb = el('button', 'blurb-close', '×');
+    closeBlurb.type = 'button';
+    closeBlurb.setAttribute('aria-label', 'Close');
+    closeBlurb.addEventListener('click', () => this.onSet('help', false));
+    this.blurbText = el('div', 'blurb-text');
+    this.blurb.append(closeBlurb, this.blurbText);
 
     // --- panel -------------------------------------------------------------
     this.panel = el('aside', 'panel');
@@ -173,7 +191,8 @@ export class Controls {
     // --- status line -------------------------------------------------------
     this.hudEl = el('div', 'hud');
 
-    host.append(bar, this.blurb, this.panel, this.hudEl);
+    host.append(bar, this.panel, this.hudEl);
+    blurbHost.append(this.blurb);
     this.sync();
   }
 
@@ -186,16 +205,17 @@ export class Controls {
         b.setAttribute('aria-pressed', String(b.dataset.value === this.state[key]));
       }
     }
+    this.blurb.hidden = !this.state.help;
     const scene = this.scenes.find((s) => s.value === this.state.scene);
-    this.blurb.textContent = scene?.blurb ?? '';
+    this.blurbText.textContent = scene?.blurb ?? '';
     // Two separate elements, not one string: GESTURE teaches the brush and
     // the scene's own hint suggests an experiment with it, and those are
     // different enough claims that running them into one line blurred both —
     // a long gesture-plus-experiment sentence read as description again,
     // exactly what .hint's rule exists to avoid. Splitting them one per line
     // keeps each readable as its own short instruction.
-    this.blurb.append(el('span', 'hint', GESTURE));
-    if (scene?.hint) this.blurb.append(el('span', 'hint-scene', scene.hint));
+    this.blurbText.append(el('span', 'hint', GESTURE));
+    if (scene?.hint) this.blurbText.append(el('span', 'hint-scene', scene.hint));
   }
 
   /** The scene changed, so the meaningful tracers did too. */

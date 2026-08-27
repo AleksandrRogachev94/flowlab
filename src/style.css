@@ -171,18 +171,30 @@ button.ghost:hover {
   background: var(--glass-solid);
 }
 
+/* Holds the blurb and the perf panel in normal document flow, one above the
+   other with a gap, so a two-line blurb pushes the perf panel down instead of
+   the two sitting at independent fixed offsets and overlapping — see
+   main.ts's leftStack. */
+.left-stack {
+  position: absolute;
+  top: 56px;
+  left: 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
 /* One sentence of plain English about the current scene, under the chips.
    The only text on screen aimed at someone who does not already know what a
    vortex street is. */
 .blurb {
-  position: absolute;
-  top: 56px;
-  left: 18px;
+  position: relative;
   /* No `right`, so the box shrink-wraps its text instead of reserving a fixed
      column: a two-word blurb should not draw a panel across half the frame.
      The cap keeps it clear of the controls panel on a narrow window. */
   max-width: min(58ch, calc(100vw - 340px));
-  padding: 9px 13px 10px;
+  padding: 9px 30px 10px 13px;
   border-radius: 11px;
   /* GLASS, not a text shadow. The shadow was the original treatment and it
      works only against a dark frame — over the wing scene's orange the dim
@@ -198,6 +210,29 @@ button.ghost:hover {
   color: var(--text);
   font-size: 13px;
   line-height: 1.5;
+}
+.blurb[hidden] {
+  display: none;
+}
+
+.blurb-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 20px;
+  height: 20px;
+  line-height: 18px;
+  text-align: center;
+  font: 15px/1 var(--ui-font);
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.blurb-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
 }
 
 /* The brush invitation, on its own line under the blurb and dimmer than it:
@@ -409,12 +444,9 @@ kbd {
 }
 
 /* The perf overlay is a <pre> written by viz/perfOverlay.ts — its columns and
-   bars are text, so it needs no layout rules, only a place to sit. Below the
-   top scrim on the left, where nothing else lives. */
+   bars are text, so it needs no layout rules beyond sizing itself: .left-stack
+   places it under the blurb. */
 .perf {
-  position: absolute;
-  top: 92px;
-  left: 18px;
   margin: 0;
   padding: 10px 12px;
   font: 11px/1.45 var(--mono-font);
@@ -439,7 +471,7 @@ kbd {
   .topbar-right {
     order: -1;
   }
-  .blurb {
+  .left-stack {
     display: none;
   }
   .panel {

@@ -7,6 +7,12 @@
  *
  *   node src/bench/step.ts [nx] [ny] [steps]
  *
+ * NOTE the solver: this leaves Simulation's default, which is SOR, while the
+ * browser's CPU engine runs cpu-mg. The two therefore print very different
+ * step shapes — pressure is ~58% here and ~1% there — so a number from this
+ * file is comparable to another number from this file, not to the overlay.
+ * The browser's own baseline is tabulated in main.ts above QUALITIES.
+ *
  * Node cannot run WebGPU, so this measures the CPU path only — which is
  * exactly what it is for. It is the baseline the GPU solver has to beat, and
  * the same Profiler drives the in-browser overlay, so the two are directly

@@ -192,7 +192,7 @@ const smokeIn: DyeOption = {
 };
 const stripesIn: DyeOption = {
   id: 'stripes',
-  label: 'Colour lines',
+  label: 'Color lines',
   source: (g) => stripeInflow({ periodCells: linePeriod(g), duty: DUTY }),
 };
 
@@ -259,7 +259,7 @@ export const SCENES: Scene[] = [
     blurb: 'A cambered wing past its stalling angle; the flow lets go of the upper surface.',
     hint: 'Try a flap on the trailing edge, or a wall in front of the nose.',
     build: (g) => airfoilChannel(g),
-    dyes: [twoToneIn(() => leadingEdgeY()), stripesIn, smokeIn, none],
+    dyes: [stripesIn, twoToneIn(() => leadingEdgeY()), smokeIn, none],
   },
   {
     id: 'cluster',

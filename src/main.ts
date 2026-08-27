@@ -41,14 +41,14 @@ const ctx = canvas.getContext('2d')!;
  * shape — see gridFor().
  *
  * Cost grows faster than the cell count on the SOR options (their sweep count
- * scales with N too), and roughly with it on multigrid. The measured all-CPU
- * baseline that set these, per step at 4:3 (npm run bench, macCormack):
+ * scales with N too), and roughly with it on multigrid. The all-CPU baseline
+ * that set these was measured on SOR, per step at 4:3, and is kept here
+ * because it is what `npm run bench` still prints by default:
  *
  *   grid       total    advect   pressure   dye
  *   320x180     70.6     16.1      28.6     25.1
  *   480x270    190.7     35.3      96.5     57.1
  *   640x360    395.6     62.8     228.8    100.8
- *
  * Most of that has since moved to the device. Measured on the fused GPU path,
  * an M4 Air at a ~1.8:1 window: medium (0.66M cells) 60 fps, high (1.31M) 30
  * fps — dead linear in the cell count at ~25 ms per million, which is what
@@ -206,6 +206,7 @@ const state: UiState = {
   quality: 'medium',
   perf: false,
   diagnostics: false,
+  help: true,
 };
 
 /**
@@ -277,13 +278,22 @@ let ready = false;
  * here needs a grid — the option lists are functions of `state` and the
  * window — so the ordering costs nothing.
  */
-const overlay = new PerfOverlay(ui);
+// The blurb and the perf panel share this column so one grows the other one
+// down in normal document flow, instead of two independent absolute
+// positions that overlap once a scene's blurb runs past one line — see
+// style.css's .left-stack.
+const leftStack = document.createElement('div');
+leftStack.className = 'left-stack';
+ui.append(leftStack);
+
+const overlay = new PerfOverlay(leftStack);
 
 const dyeOptions = (): Option[] =>
   sceneById(state.scene).dyes.map((d) => ({ value: d.id, label: d.label }));
 
 const controls = new Controls(
   ui,
+  leftStack,
   state,
   {
     scenes: SCENE_OPTIONS,
@@ -320,6 +330,12 @@ const controls = new Controls(
  * resolving the interpolation's own kinks rather than the flow, and the extra
  * cells buy artifacts. Whole numbers only, so the two grids cover exactly the
  * same rectangle.
+ *
+ * NOT conditioned on the engine, and the CPU pays 3x for that (see QUALITIES
+ * for the measurement). Keeping it engine-independent is Rule 5: switching
+ * engine must change the engine and nothing else, or the control stops being
+ * a control. It is also what lets the engine toggle hand the flow over at a
+ * frame boundary instead of rebuilding every dye buffer under it.
  */
 function dyeScaleFor(ny: number): number {
   const rows = window.innerHeight * (window.devicePixelRatio || 1);
@@ -412,7 +428,7 @@ function rebuild(): void {
   app = {
     sim,
     view: new FieldView(sim.g, sim.dyeG),
-    cpuAdvector: new CpuAdvector(sim.g),
+    cpuAdvector: new CpuAdvector(sim.g, sim.dyeG),
     solvers: new Map(),
     gpu: gpuCtx ? buildGpu(gpuCtx, sim) : null,
   };
@@ -580,6 +596,7 @@ const KEYS: Record<string, () => void> = {
   v: () => set('arrows', !state.arrows),
   p: () => set('perf', !state.perf),
   c: () => controls.togglePanel(),
+  h: () => set('help', !state.help),
 };
 
 window.addEventListener('keydown', (e) => {
