@@ -251,10 +251,31 @@ export class FieldView {
         }
       }
     }
-    // Pale, not black: black reads as a hole in the background, and a light
-    // body stays legible under both the dark dye view and the dark-at-zero
-    // vorticity map. It is also what reference images of this benchmark use.
-    ctx.fillStyle = '#b4becc';
+    // A DARK body with a lit rim, and the rim is what makes the dark possible.
+    //
+    // This used to be a pale grey fill, on the argument that black reads as a
+    // hole. True, but the fill was competing: the dye view's background IS
+    // black, so a near-white slab was the brightest object in the frame and it
+    // sat in the middle of it, pulling the eye off the smoke it exists to
+    // interrupt. The rim keeps the silhouette legible on both dark views — the
+    // dye view and iceFire's dark-at-zero vorticity map — while the body
+    // itself recedes to roughly the background, so the picture is the flow.
+    //
+    // Drawn as a SHADOW and not a stroke, and that is forced rather than
+    // stylistic. solidsPath is a union of one rect per solid cell, so stroking
+    // it would outline every interior cell edge as well as the outline, and
+    // the body would come back as a bright grid. A shadow is cast from the
+    // composited alpha of the whole path, which has no interior edges in it —
+    // the same reason the path is filled once rather than per cell, one step
+    // further on. Two passes because a single one is barely visible at this
+    // radius, and the fill is opaque so the glow only ever shows outside.
+    const dpr = ctx.canvas.width / (ctx.canvas.clientWidth || ctx.canvas.width);
+    ctx.save();
+    ctx.shadowColor = 'rgba(150, 200, 255, 0.75)';
+    ctx.shadowBlur = 9 * dpr;
+    ctx.fillStyle = '#161c26';
     ctx.fill(this.solidsPath);
+    ctx.fill(this.solidsPath);
+    ctx.restore();
   }
 }

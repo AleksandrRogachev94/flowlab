@@ -41,6 +41,25 @@ export function solidDisk(cx: number, cy: number, r: number): LabelSeed {
 }
 
 /**
+ * An axis-aligned solid slab, corners in WORLD units. Rasterized by cell
+ * centre like solidDisk, so a slab thinner than a cell can vanish entirely —
+ * quote thin plates as a multiple of g.h rather than as a fixed length, or a
+ * low resolution silently deletes them.
+ */
+export function solidRect(x0: number, y0: number, x1: number, y1: number): LabelSeed {
+  return (g, label) => {
+    for (let j = 0; j < g.ny; j++) {
+      const y = (j + 0.5) * g.h;
+      if (y < y0 || y > y1) continue;
+      for (let i = 0; i < g.nx; i++) {
+        const x = (i + 0.5) * g.h;
+        if (x >= x0 && x <= x1) label[idxP(g, i, j)] = Cell.Solid;
+      }
+    }
+  };
+}
+
+/**
  * The rightmost column becomes Air — an open outflow.
  *
  * Two things happen at once, and both matter. The pressure system stops being

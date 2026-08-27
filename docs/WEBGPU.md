@@ -662,9 +662,10 @@ reset and uploaded once.
 The one wrinkle is that a patch has to be able to write only PART of its
 rectangle. `wallJet` skips the rows outside its band, and it has to: those rows
 are ordinary fluid the recirculation carries dye into, and writing black over
-them every step would scrub it away. `karmanBands` is the opposite — the whole
-left edge is inflow there, and §-the-long-comment-in-karman.ts explains what
-went wrong when those rows were left unwritten. One coverage plane alongside
+them every step would scrub it away. `stripeInflow` is the opposite — the whole
+left edge is inflow on a channel scene, so the dark GAPS between its lines are
+as much a boundary condition as the lines themselves, and leaving them
+unwritten let dye accumulate along the inlet and feed the whole channel. One coverage plane alongside
 the three value planes settles both: the apply is a lerp, so 1 overwrites, 0
 leaves the cell alone, and a tapered edge is free.
 

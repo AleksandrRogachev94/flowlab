@@ -5,25 +5,34 @@
  * The domain is one unit tall by construction (Simulation sets h = 1/ny), so
  * every length here reads as a fraction of the channel height. The benchmark's
  * standard sizing rules: blockage D/H <= ~0.15, >= 5D upstream, >= 15D
- * downstream. D = 0.11 on a 16:9 grid gives blockage 0.11, 4D upstream and 12D
  * downstream. Wake length is measured in DIAMETERS, so a longer street wants a
  * SMALLER cylinder rather than a wider box — but a smaller one is also more
  * staircase than circle. Measured across that trade, D = 0.11 gave the
- * textbook-closest St (0.195 against 0.180 at D = 0.08).
+ * textbook-closest St (0.195 against 0.180 at D = 0.08), and that is the value
+ * to set if a number is what you want.
+ *
+ * The DEFAULT is 0.14, and it is a legibility choice rather than a fluid one.
+ * The smoke rake runs 22 lines across the height, so a line every 0.045; at
+ * D = 0.11 only about two and a half of them ever cross the body, which puts
+ * the split that generates the entire street at the smallest visible scale in
+ * the frame. 0.14 puts three across it, stays inside the blockage guideline,
+ * and costs roughly 12D of downstream for 9.5D — still three or four vortex
+ * pairs before the outlet. Going much past 0.15 is where the walls start
+ * setting the shedding frequency instead of the body.
  *
  * WHAT SETS THE REYNOLDS NUMBER: nothing here. There is no viscosity term, so
  * the effective Re is whatever semi-Lagrangian dissipation makes it — set by
  * RESOLUTION, not by any knob. Expect a plausible street; do not expect a
  * trustworthy Strouhal number until real viscosity exists.
  *
- * Geometry+velocity and dye are two separate exports. They share the cylinder
- * sizing through `defaultKarman`, but nothing else: a scene is a flow, and
- * which tracer rides it is the viewer's choice (see scenes/catalog.ts).
+ * Geometry and velocity only. Dye is the catalog's business: a scene is a
+ * flow, and which tracer rides it is the viewer's choice. What this file owes
+ * the catalog is `centreY` — the stagnation streamline's height, which is
+ * where the two-tone rake splits its colours (see scenes/catalog.ts).
  */
 
-import { inDyeCells, makeDyePatch } from '../core/dye.ts';
 import { type Grid } from '../core/grid.ts';
-import type { DyeSource, SceneSpec, Seed } from '../core/simulation.ts';
+import type { SceneSpec, Seed } from '../core/simulation.ts';
 import { allLabels, openRight, solidDisk } from './obstacles.ts';
 
 export interface KarmanOptions {
@@ -33,15 +42,12 @@ export interface KarmanOptions {
   diameter: number;
   /** Cylinder centre x, in world units. */
   cx: number;
-  /** Dye source thickness, in cells inward from the inlet. */
-  depthCells: number;
 }
 
 export const defaultKarman: KarmanOptions = {
   speed: 1,
-  diameter: 0.11,
+  diameter: 0.14,
   cx: 0.45,
-  depthCells: 2,
 };
 
 /**
@@ -60,14 +66,17 @@ export const defaultKarman: KarmanOptions = {
  * quarter cell makes the top and bottom staircases genuinely different.
  *
  * Takes the grid because this is the one length here that cannot be
- * resolution-independent. The dye bands read it too, so they stay centred on
- * the body at any resolution.
+ * resolution-independent. Exported because it is also the STAGNATION
+ * STREAMLINE's height: the free stream divides here, everything above the line
+ * feeds the upper shear layer and everything below feeds the lower one, and
+ * that is exactly where the two-tone rake has to change colour for the two
+ * tints to mean "which layer shed this vortex".
  */
-function centreY(g: Grid): number {
+export function centreY(g: Grid): number {
   return 0.5 + 0.25 * g.h;
 }
 
-/** Cylinder, outlet and free stream. No dye — see karmanBands. */
+/** Cylinder, outlet and free stream. No dye — see the file comment. */
 export function karmanChannel(g: Grid, options: Partial<KarmanOptions> = {}): SceneSpec {
   const { speed, diameter, cx } = { ...defaultKarman, ...options };
 
@@ -84,56 +93,4 @@ export function karmanChannel(g: Grid, options: Partial<KarmanOptions> = {}): Sc
     labels: allLabels(openRight(), solidDisk(cx, centreY(g), 0.5 * diameter)),
     seed,
   };
-}
-
-/**
- * Three horizontal dye bands at the inlet, centred on the cylinder —
- * streaklines. Each enters straight and the roll-up shears them past each
- * other, so alternating vortices read as alternating colour instead of a grey
- * blur.
- *
- * The band edges line up with the BODY, not with equal thirds. The middle
- * band is exactly one diameter wide, so it is precisely the stream tube the
- * cylinder splits — the fluid that becomes both shear layers and both
- * families of vortex cores. The outer bands are half a diameter each and
- * carry fluid that passes above or below without ever touching it. Under
- * equal thirds every colour was a MIXTURE of the two populations, which is
- * what made the middle band read as merely "thin".
- *
- * It stays thin either way, and that is physics, not a defect: the flux
- * between two streamlines is conserved, so a material band's width goes as
- * 1/speed. The stagnation tube necessarily narrows as it accelerates around
- * the shoulder, then gets wound into the cores. Total span is 2D — much
- * wider and the outer bands sail past the wake without entering it.
- *
- * EVERY ROW of the inlet columns is written, including the clean fluid outside
- * the bands, and skipping those rows was a real bug rather than an
- * optimisation. The whole left edge is inflow here, so "clean fluid arrives
- * outside the bands" is a boundary condition and has to be imposed like one.
- * Leaving those cells unwritten instead made them free: the backtrace at i = 0
- * clamps to the domain edge, so an inlet cell effectively copies itself, and
- * whatever dye reached it by the shedding's vertical velocity and by numerical
- * diffusion was then RETAINED and re-copied every step. Measured on the wake:
- * the dyed fraction of the inlet column climbed 26% -> 56% over 90 s with no
- * sign of stopping, and total dye in the domain grew with it — a dyed strip
- * spreading along the inlet, feeding the whole channel. That is what made the
- * bands look like they were stretching further and further vertically.
- */
-export function karmanBands(g: Grid, options: Partial<KarmanOptions> = {}): DyeSource {
-  const { diameter, depthCells } = { ...defaultKarman, ...options };
-  const cy = centreY(g);
-
-  // Coverage 1 on every row, including the clean fluid outside the bands —
-  // that is the paragraph above, expressed as data.
-  return (dg, vg) =>
-    makeDyePatch(0, 0, Math.min(inDyeCells(depthCells, vg, dg), dg.nx), dg.ny, (_i, j, rgb) => {
-      const d = (j + 0.5) * dg.h - cy;
-      const inBand = Math.abs(d) < diameter;
-      // Below / the body's own tube / above, and -1 for the clean fluid
-      // outside — which selects no channel, so all three get 0. Assumes the
-      // three RGB channels.
-      const band = inBand ? (Math.abs(d) < 0.5 * diameter ? 1 : d < 0 ? 0 : 2) : -1;
-      for (let c = 0; c < rgb.length; c++) rgb[c] = c === band ? 1 : 0;
-      return 1;
-    });
 }

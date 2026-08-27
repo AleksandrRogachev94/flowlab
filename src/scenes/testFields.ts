@@ -114,6 +114,34 @@ export function addDyeMono(g: Grid, dye: FieldArray[], r = 0.15): void {
 }
 
 /**
+ * Line spacing in CELLS for `lines` lines evenly spaced across the domain
+ * HEIGHT — the one conversion every banded tracer here needs.
+ *
+ * It exists because the alternative kept getting this wrong in one direction
+ * or the other. A spacing quoted directly in cells is a different PICTURE at
+ * every resolution: the inlet rake was fixed years-of-commits ago to a count,
+ * but addDyeStripes was left at a flat 12 cells, which is 70 stripes at
+ * ny = 850 — past the point where the eye can follow any individual one, and
+ * far enough past it that neighbouring bands alias into moire. The eye's limit
+ * is how many lines it can TRACK, and that number does not change with the
+ * grid.
+ *
+ * Floored at 8 cells for the opposite failure: below that, strain thins a band
+ * past the grid within a few diameters and the lines dissolve.
+ */
+export function linePeriodCells(g: Grid, lines: number): number {
+  return Math.max(8, Math.round(g.ny / lines));
+}
+
+/**
+ * Line count for the SEEDED stripe tracer. Denser than the inlet rake's 22,
+ * because a seeded field has to fill a closed box on its own rather than being
+ * fed continuously through one edge, and because the closed-box scenes are
+ * about filament stretching — which wants more material lines to stretch.
+ */
+const SEEDED_LINES = 30;
+
+/**
  * Horizontal bands across the whole domain — the strain map.
  *
  * Where addDyeTriad's three fat blobs answer "where did this fluid come from",
@@ -129,7 +157,11 @@ export function addDyeMono(g: Grid, dye: FieldArray[], r = 0.15): void {
  * flat grey almost immediately, which is why this was not a useful tracer
  * before.
  */
-export function addDyeStripes(g: Grid, dye: FieldArray[], periodCells = 12): void {
+export function addDyeStripes(
+  g: Grid,
+  dye: FieldArray[],
+  periodCells = linePeriodCells(g, SEEDED_LINES),
+): void {
   for (let j = 0; j < g.ny; j++) {
     for (let c = 0; c < dye.length; c++) {
       const v = stripeAt(g, j, periodCells, c, dye.length);
@@ -244,13 +276,36 @@ export interface StripeOptions {
   /** Source thickness, in cells inward from the inlet. */
   depthCells?: number;
   /**
-   * One fixed colour for every line instead of the height hue ramp. Two
-   * different instruments: the ramp LABELS each line, so you can follow one
-   * particular filament through a wake, while a single colour gives up the
-   * labelling and buys back contrast, every line being at full brightness
-   * rather than at whatever its point on the ramp allows.
+   * A fixed colour for the lines instead of the height hue ramp — either one
+   * colour, or a function of WORLD y so the rake can be coloured by where a
+   * line entered.
+   *
+   * Three instruments, not one prettier than the next:
+   *
+   *   The HUE RAMP labels every line individually, so a particular filament
+   *   can be followed through a wake. It pays for that in contrast: each line
+   *   sits at whatever brightness its point on the ramp allows.
+   *
+   *   ONE COLOUR gives up the labelling and buys the contrast back, every
+   *   line at full brightness. The smoke-wire photograph.
+   *
+   *   A FUNCTION of y is the useful middle, and the reason this stopped being
+   *   a plain array. Split the rake in two at a streamline that means
+   *   something — the stagnation streamline of a cylinder, the splitter
+   *   plate's trailing edge, an aerofoil's leading edge — and colour reports
+   *   which SIDE of it a line came from, while every line keeps full
+   *   brightness and its edges. In a Kármán street that is exactly the
+   *   question worth answering: the wake sheds alternately from the upper and
+   *   lower shear layers, so the two colours arrive alternately, one per
+   *   vortex. Where they interleave below the cell scale the two tints average
+   *   toward white, which is the same diffusion probe addDyeTriad gives.
+   *
+   * Two tints and not three, deliberately. One-hot RGB bands desaturate to
+   * grey the moment they mix, and the middle band of a three-way split is the
+   * stagnation tube — the fluid that feeds BOTH families of vortex, so it
+   * labels nothing.
    */
-  tint?: readonly number[];
+  tint?: readonly number[] | ((y: number) => readonly number[]);
 }
 
 /** An options object rather than four positional arguments: three of them are
@@ -266,11 +321,19 @@ export function stripeInflow(options: StripeOptions = {}): DyeSource {
   // Coverage 1 on every row, gaps included: those zeros are the clean fluid
   // between the lines arriving, and they are as much a boundary condition as
   // the lines are. See the long note on karmanBands.
+  // Normalized once, so the per-cell loop below has one shape to deal with
+  // rather than three. `null` means the hue ramp.
+  const colourAt = tint === undefined ? null : typeof tint === 'function' ? tint : () => tint;
+
   return (dg, g) =>
     makeDyePatch(0, 0, Math.min(inDyeCells(depthCells, g, dg), dg.nx), dg.ny, (_i, j, rgb) => {
       const ribbon = ribbonAt(dg, j, inDyeCells(periodCells, g, dg), duty);
+      // World y, not a row index: a split height is a physical position, and
+      // the caller quotes it against the VELOCITY grid while j indexes the dye
+      // grid. Both are world coordinates, so this is the one place they meet.
+      const colour = colourAt?.((j + 0.5) * dg.h);
       for (let c = 0; c < rgb.length; c++) {
-        rgb[c] = ribbon * (tint ? tint[c] : hueAt(dg, j, c, rgb.length));
+        rgb[c] = ribbon * (colour ? colour[c] : hueAt(dg, j, c, rgb.length));
       }
       return 1;
     });
