@@ -45,6 +45,9 @@ export interface Advector {
    * Passive dye channels carried by (u, v), which must be the PROJECTED
    * velocity — a divergence-free carrier neither concentrates nor thins a
    * tracer. Channels are independent; nothing couples them.
+   *
+   * `dg` is the grid the dye lives on, defaulting to the velocity grid. See
+   * advectScalar for what the split means and why it is nearly free.
    */
   dye(
     g: Grid,
@@ -55,6 +58,7 @@ export interface Advector {
     qOut: FieldArray[],
     label: Uint8Array,
     dt: number,
+    dg?: Grid,
   ): void | Promise<void>;
 }
 
@@ -74,10 +78,10 @@ export class CpuAdvector implements Advector {
   /** One buffer serves every dye channel: they are advected one at a time. */
   private readonly qHat: Float64Array;
 
-  constructor(g: Grid) {
+  constructor(g: Grid, dg: Grid = g) {
     this.uHat = new Float64Array((g.nx + 1) * g.ny);
     this.vHat = new Float64Array(g.nx * (g.ny + 1));
-    this.qHat = new Float64Array(g.nx * g.ny);
+    this.qHat = new Float64Array(dg.nx * dg.ny);
   }
 
   velocity(
@@ -106,12 +110,13 @@ export class CpuAdvector implements Advector {
     qOut: FieldArray[],
     label: Uint8Array,
     dt: number,
+    dg: Grid = g,
   ): void {
     for (let c = 0; c < qIn.length; c++) {
       if (scheme === 'macCormack') {
-        advectScalarMacCormack(g, u, v, qIn[c], this.qHat, qOut[c], label, dt);
+        advectScalarMacCormack(g, u, v, qIn[c], this.qHat, qOut[c], label, dt, dg);
       } else {
-        advectScalar(g, u, v, qIn[c], qOut[c], label, dt);
+        advectScalar(g, u, v, qIn[c], qOut[c], label, dt, dg);
       }
     }
   }

@@ -21,7 +21,8 @@
  * which tracer rides it is the viewer's choice (see scenes/catalog.ts).
  */
 
-import { idxP, type Grid } from '../core/grid.ts';
+import { inDyeCells, makeDyePatch } from '../core/dye.ts';
+import { type Grid } from '../core/grid.ts';
 import type { DyeSource, SceneSpec, Seed } from '../core/simulation.ts';
 import { allLabels, openRight, solidDisk } from './obstacles.ts';
 
@@ -122,19 +123,17 @@ export function karmanBands(g: Grid, options: Partial<KarmanOptions> = {}): DyeS
   const { diameter, depthCells } = { ...defaultKarman, ...options };
   const cy = centreY(g);
 
-  return (gg, dye) => {
-    const depth = Math.min(depthCells, gg.nx);
-    for (let j = 0; j < gg.ny; j++) {
-      const d = (j + 0.5) * gg.h - cy;
+  // Coverage 1 on every row, including the clean fluid outside the bands —
+  // that is the paragraph above, expressed as data.
+  return (dg, vg) =>
+    makeDyePatch(0, 0, Math.min(inDyeCells(depthCells, vg, dg), dg.nx), dg.ny, (_i, j, rgb) => {
+      const d = (j + 0.5) * dg.h - cy;
       const inBand = Math.abs(d) < diameter;
       // Below / the body's own tube / above, and -1 for the clean fluid
       // outside — which selects no channel, so all three get 0. Assumes the
       // three RGB channels.
       const band = inBand ? (Math.abs(d) < 0.5 * diameter ? 1 : d < 0 ? 0 : 2) : -1;
-      for (let i = 0; i < depth; i++) {
-        const k = idxP(gg, i, j);
-        for (let c = 0; c < dye.length; c++) dye[c][k] = c === band ? 1 : 0;
-      }
-    }
-  };
+      for (let c = 0; c < rgb.length; c++) rgb[c] = c === band ? 1 : 0;
+      return 1;
+    });
 }

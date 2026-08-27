@@ -21,10 +21,12 @@ import {
   type UiKey,
   type UiState,
 } from './ui/controls.ts';
+import { DyeRenderer } from './viz/dyeGpu.ts';
 import { FieldView, VIEWS, type View } from './viz/fieldView.ts';
 import { PerfOverlay } from './viz/perfOverlay.ts';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#view')!;
+const dyeCanvas = document.querySelector<HTMLCanvasElement>('#dye')!;
 const ui = document.querySelector<HTMLDivElement>('#ui')!;
 const ctx = canvas.getContext('2d')!;
 
@@ -215,12 +217,16 @@ interface App {
   gpu: GpuBundle | null;
 }
 
-/** The device-side objects. All four are sized to one grid. */
+/** The device-side objects. All of them are sized to one grid. */
 interface GpuBundle {
   advector: GpuAdvector;
   mg: GpuMultigridSolver;
   rbsor: GpuPressureSolver;
   stepper: GpuStepper;
+  /** Draws the dye view from the advector's resident buffer — the reason the
+   *  dye never has to come back to the host. Null only if the canvas would not
+   *  give up a 'webgpu' context, which is not survivable on this path. */
+  dyeView: DyeRenderer;
 }
 
 let app: App;
@@ -249,6 +255,9 @@ const cpuMg = new CpuMultigridSolver();
  */
 let pendingRebuild = false;
 let pendingRestart = false;
+/** Engine/solver changes, deferred for the reason above plus the one in
+ *  applyEngineDeferred. */
+let pendingEngine = false;
 
 /** Stepping is held off until the GPU probe resolves — see boot(). */
 let ready = false;
@@ -287,6 +296,30 @@ const controls = new Controls(
 
 /* ------------------------------------------------------------------- build */
 
+/**
+ * How much finer than the velocity grid the dye is stored — Simulation's
+ * `dyeScale`.
+ *
+ * Pinned to the DISPLAY rather than set as a fixed multiplier, and that is the
+ * whole design of the knob. Rendering more dye cells than there are pixels to
+ * show them in is work nobody can see, so `floor` of the ratio is the natural
+ * cap and it makes the setting self-limiting: at 'very high' on most screens
+ * the grid already matches the display and this returns 1, changing nothing.
+ * At 'medium' on a retina laptop it returns 2, which is where the win is —
+ * that is exactly the case where the old path was upscaling a 600-row picture
+ * to an 1800-pixel canvas and calling the blur numerical diffusion.
+ *
+ * Capped at 2 because the carrier velocity is bilinearly interpolated, so it
+ * is effectively band-limited at the velocity grid: past ~2x the dye starts
+ * resolving the interpolation's own kinks rather than the flow, and the extra
+ * cells buy artifacts. Whole numbers only, so the two grids cover exactly the
+ * same rectangle.
+ */
+function dyeScaleFor(ny: number): number {
+  const rows = window.innerHeight * (window.devicePixelRatio || 1);
+  return Math.max(1, Math.min(2, Math.floor(rows / ny)));
+}
+
 /** Rows from the quality setting, columns from the window: the grid is the
  *  same shape as the viewport, so the canvas needs no letterbox. */
 function gridFor(quality: Quality): { nx: number; ny: number } {
@@ -315,17 +348,19 @@ function fitCanvas(): void {
 }
 
 function buildGpu(ctx: GpuContext, sim: Simulation): GpuBundle {
-  const advector = new GpuAdvector(ctx, sim.g);
+  const advector = new GpuAdvector(ctx, sim.g, sim.dyeG);
   const mg = new GpuMultigridSolver(ctx, sim.g);
   return {
     advector,
     mg,
     rbsor: new GpuPressureSolver(ctx, sim.g),
     stepper: new GpuStepper(ctx, sim.g, advector, mg),
+    dyeView: new DyeRenderer(ctx, dyeCanvas, sim.dyeG, advector.dyeIn),
   };
 }
 
 function destroyGpu(bundle: GpuBundle): void {
+  bundle.dyeView.destroy();
   bundle.stepper.destroy();
   bundle.advector.destroy();
   bundle.mg.destroy();
@@ -359,11 +394,12 @@ function rebuild(): void {
       residualEvery: 4,
     },
     Float32Array,
+    dyeScaleFor(ny),
   );
 
   app = {
     sim,
-    view: new FieldView(sim.g),
+    view: new FieldView(sim.g, sim.dyeG),
     cpuAdvector: new CpuAdvector(sim.g),
     solvers: new Map(),
     gpu: gpuCtx ? buildGpu(gpuCtx, sim) : null,
@@ -407,6 +443,26 @@ function applyEngine(): void {
   sim.solver = app.solvers.get(state.solver) ?? cpuMg;
   sim.stepper = onGpu && sim.solver === gpu.mg ? gpu.stepper : null;
   sim.stepper?.invalidate();
+}
+
+/**
+ * applyEngine plus the one thing that has to happen at a frame boundary rather
+ * than inside an event handler: bringing the dye home.
+ *
+ * While the fused path drives, the DEVICE holds the authoritative dye — the
+ * host's copy is whatever reset() last wrote (see GpuStep.readDye). Anything
+ * else taking over would advect that stale field and the picture would jump
+ * back in time. The readback is async, which is why the engine and solver
+ * widgets queue this through pendingEngine instead of calling applyEngine
+ * directly the way they used to.
+ */
+async function applyEngineDeferred(): Promise<void> {
+  const wasFused = app.sim.stepper !== null;
+  const { gpu } = app;
+  applyEngine();
+  if (wasFused && app.sim.stepper === null && gpu) {
+    await gpu.stepper.readDye(app.sim.f.dye);
+  }
 }
 
 function sceneById(id: string): Scene {
@@ -466,10 +522,10 @@ function apply(key: UiKey): void {
         state.solver = SOLVERS[state.engine][0].value;
       }
       controls.setSolvers(SOLVERS[state.engine]);
-      applyEngine();
+      pendingEngine = true;
       break;
     case 'solver':
-      applyEngine();
+      pendingEngine = true;
       break;
     case 'scheme':
       // Read fresh every step, so this takes effect on the next one and the
@@ -555,6 +611,13 @@ function dropGpu(why: string): void {
   app.solvers.delete('gpu-rbsor');
   controls.setGpuAvailable(false);
   set('engine', 'cpu');
+  // set() only QUEUES the engine change, and this runs mid-frame with a failed
+  // submit behind it: the caller's immediate retry would otherwise still be
+  // holding the destroyed stepper. Nothing is lost by doing it here instead —
+  // applyEngineDeferred's readback exists to rescue the dye from a working
+  // device, and there is no longer one.
+  applyEngine();
+  pendingEngine = false;
 }
 
 /* -------------------------------------------------------------------- frame */
@@ -620,6 +683,10 @@ async function frame(): Promise<void> {
     pendingRestart = false;
     restart();
   }
+  if (pendingEngine) {
+    pendingEngine = false;
+    await applyEngineDeferred();
+  }
 
   if (ready) {
     try {
@@ -631,7 +698,19 @@ async function frame(): Promise<void> {
   }
 
   drawPerf.begin();
-  const { maxSpeed, divMax, divRms } = app.view.draw(ctx, app.sim, state.view, state.arrows);
+  // The dye view comes off the device whenever the fused path is driving,
+  // which is the only time the device holds the authoritative dye. The 2D
+  // canvas on top is then cleared and carries only the solids and the arrows.
+  const dyeOnDevice = state.view === 'dye' && app.sim.stepper !== null && app.gpu !== null;
+  dyeCanvas.hidden = !dyeOnDevice;
+  if (dyeOnDevice) app.gpu!.dyeView.draw();
+  const { maxSpeed, divMax, divRms } = app.view.draw(
+    ctx,
+    app.sim,
+    state.view,
+    state.arrows,
+    dyeOnDevice,
+  );
   drawPerf.mark('draw');
 
   controls.setHud(statusLine(maxSpeed, divMax, divRms));

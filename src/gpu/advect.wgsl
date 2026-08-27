@@ -22,6 +22,16 @@
 // buffer. Same arithmetic, one less pass over memory, and this kernel is
 // memory-bound.
 
+// TWO grids, and only the dye kernels can tell the difference.
+//
+// nx/ny/h describe the VELOCITY grid — the carrier, the labels, and the u/v
+// fields themselves. dnx/dny/dh describe the DYE grid, which is the same grid
+// unless Simulation was built with a dyeScale above 1 (see its `dyeG`).
+//
+// The split is this cheap because every kernel below already works in WORLD
+// coordinates: a thread turns its index into an (x, y) and every sampler turns
+// an (x, y) back into indices on ITS OWN field. So carrierU/carrierV need no
+// change at all — they were never told which grid the caller sits on.
 struct Params {
   nx: u32,
   ny: u32,
@@ -29,6 +39,12 @@ struct Params {
   // Signed: the forward pass traces back by +dt, the fused correction traces
   // both ways from it.
   dt: f32,
+  dnx: u32,
+  dny: u32,
+  dh: f32,
+  // std140 rounds a uniform struct up to 16 bytes; naming the slot beats
+  // letting the layout do it silently.
+  pad: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -47,6 +63,8 @@ const CHANNELS: u32 = 3u;
 // ---------------------------------------------------------------- indexing
 
 fn idxP(i: i32, j: i32) -> u32 { return u32(i) + u32(j) * params.nx; }
+/** idxP on the DYE grid. */
+fn idxD(i: i32, j: i32) -> u32 { return u32(i) + u32(j) * params.dnx; }
 fn idxU(i: i32, j: i32) -> u32 { return u32(i) + u32(j) * (params.nx + 1u); }
 fn idxV(i: i32, j: i32) -> u32 { return u32(i) + u32(j) * params.nx; }
 
@@ -57,6 +75,21 @@ fn solidOrOutside(i: i32, j: i32) -> bool {
     return true;
   }
   return label[idxP(i, j)] == SOLID;
+}
+
+/**
+ * The same question asked from a DYE cell. Labels are the solver's geometry
+ * and stay on the velocity grid — a finer copy would only be the same
+ * staircase drawn with more steps — so the dye cell's CENTRE is mapped across
+ * and the coarse cell answers. At dyeScale 1 the ratio is 1 and this reduces
+ * to solidOrOutside(i, j) exactly.
+ */
+fn dyeSolidOrOutside(i: i32, j: i32) -> bool {
+  let r = params.dh / params.h;
+  return solidOrOutside(
+    i32(floor((f32(i) + 0.5) * r)),
+    i32(floor((f32(j) + 0.5) * r)),
+  );
 }
 
 // ------------------------------------------------------------ interpolation
@@ -124,10 +157,10 @@ fn srcV(x: f32, y: f32) -> f32 {
 /** sampleP on one dye channel of src. `base` selects the channel: the three
  *  channels share one buffer, laid out end to end. */
 fn srcQ(x: f32, y: f32, base: u32) -> f32 {
-  let a = axis(x / params.h - 0.5, i32(params.nx));
-  let b = axis(y / params.h - 0.5, i32(params.ny));
-  let k = base + idxP(a.i0, b.i0);
-  let s = params.nx;
+  let a = axis(x / params.dh - 0.5, i32(params.dnx));
+  let b = axis(y / params.dh - 0.5, i32(params.dny));
+  let k = base + idxD(a.i0, b.i0);
+  let s = params.dnx;
   return bilerp(src[k], src[k + 1u], src[k + s], src[k + s + 1u], a.f, b.f);
 }
 
@@ -156,10 +189,10 @@ fn clampOrigV(x: f32, y: f32, q: f32) -> f32 {
 }
 
 fn clampOrigQ(x: f32, y: f32, q: f32, base: u32) -> f32 {
-  let a = axis(x / params.h - 0.5, i32(params.nx));
-  let b = axis(y / params.h - 0.5, i32(params.ny));
-  let k = base + idxP(a.i0, b.i0);
-  let s = params.nx;
+  let a = axis(x / params.dh - 0.5, i32(params.dnx));
+  let b = axis(y / params.dh - 0.5, i32(params.dny));
+  let k = base + idxD(a.i0, b.i0);
+  let s = params.dnx;
   return clampToRange(q, orig[k], orig[k + 1u], orig[k + s], orig[k + s + 1u]);
 }
 
@@ -184,7 +217,9 @@ fn backtrace(x: f32, y: f32, u0: f32, v0: f32, dt: f32) -> vec2<f32> {
 //
 // A face or cell touching a solid copies its source through rather than
 // skipping: `dst` is a separate buffer and would otherwise keep stale
-// ping-pong data. Bounds match subtractGradient's, so a face advection writes
+// ping-pong data. The dye entries are the ones on the dye grid — dnx by dny —
+// so they use idxD, dh and dyeSolidOrOutside where the velocity entries use
+// the plain ones; everything else about them is unchanged. Bounds match subtractGradient's, so a face advection writes
 // is always one projection can correct.
 
 @compute @workgroup_size(8, 8)
@@ -225,19 +260,19 @@ fn advect_v(@builtin(global_invocation_id) gid: vec3<u32>) {
  *  three values is a third of the CPU's work, not the same work three times. */
 @compute @workgroup_size(8, 8)
 fn advect_dye(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= params.nx || gid.y >= params.ny) { return; }
+  if (gid.x >= params.dnx || gid.y >= params.dny) { return; }
   let i = i32(gid.x);
   let j = i32(gid.y);
-  let k = idxP(i, j);
-  let cells = params.nx * params.ny;
-  if (solidOrOutside(i, j)) {
+  let k = idxD(i, j);
+  let cells = params.dnx * params.dny;
+  if (dyeSolidOrOutside(i, j)) {
     for (var c = 0u; c < CHANNELS; c++) {
       dst[k + c * cells] = src[k + c * cells];
     }
     return;
   }
-  let x = (f32(i) + 0.5) * params.h;
-  let y = (f32(j) + 0.5) * params.h;
+  let x = (f32(i) + 0.5) * params.dh;
+  let y = (f32(j) + 0.5) * params.dh;
   // A cell centre stores NEITHER component, so both are interpolated.
   let b = backtrace(x, y, carrierU(x, y), carrierV(x, y), params.dt);
   for (var c = 0u; c < CHANNELS; c++) {
@@ -296,19 +331,19 @@ fn correct_v(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn correct_dye(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= params.nx || gid.y >= params.ny) { return; }
+  if (gid.x >= params.dnx || gid.y >= params.dny) { return; }
   let i = i32(gid.x);
   let j = i32(gid.y);
-  let k = idxP(i, j);
-  let cells = params.nx * params.ny;
-  if (solidOrOutside(i, j)) {
+  let k = idxD(i, j);
+  let cells = params.dnx * params.dny;
+  if (dyeSolidOrOutside(i, j)) {
     for (var c = 0u; c < CHANNELS; c++) {
       dst[k + c * cells] = orig[k + c * cells];
     }
     return;
   }
-  let x = (f32(i) + 0.5) * params.h;
-  let y = (f32(j) + 0.5) * params.h;
+  let x = (f32(i) + 0.5) * params.dh;
+  let y = (f32(j) + 0.5) * params.dh;
   let u0 = carrierU(x, y);
   let v0 = carrierV(x, y);
   let rev = backtrace(x, y, u0, v0, -params.dt);

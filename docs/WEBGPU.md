@@ -1,7 +1,11 @@
 # The WebGPU port
 
-Two pieces of the step run on the device: the **pressure solve** (§1-§5, now
-multigrid — §9) and **advection and dye** (§8). Everything else is still CPU.
+The whole step runs on the device: the **pressure solve** (§1-§5, now
+multigrid — §9), **advection and dye** (§8), the glue kernels that fused them
+into one submit (§11), and the dye's sources and its rendering (§12). What is
+left on the host is the CFL scan, the residual diagnostic, and the three
+analysis views.
+
 This document covers why those pieces were chosen, how they are put together,
 and the two things that went wrong: the ω trap (§4) and the outlet backflow
 instability that the higher resolution exposed (§10).
@@ -595,7 +599,8 @@ What still crosses the bus, per frame: dye up (the host mirror is
 authoritative — decay and the scene's `DyeSource` closure run there, which is
 why every source works unchanged), u/v/dye down (CFL, the residual diagnostic,
 the arrows, the canvas draw). `p` never crosses: it warm-starts where it
-lives. `invalidate()` re-syncs after a reset or frames stepped on another
+lives. **§12 removed the dye from both directions**, which is what the last
+paragraph of this section was pointing at. `invalidate()` re-syncs after a reset or frames stepped on another
 solver, and re-runs the label coarsening — the one per-frame dispatch chain
 that became per-scene.
 
@@ -627,3 +632,131 @@ count (3 is §9's choice; the physics-indifference measurements suggest 2 is
 worth trying), the readback (only the DRAW truly needs dye on the host — a
 WebGPU render path would keep it resident and retire the canvas blit too),
 and the residual diagnostic, which is a third of the host time left.
+
+## 12. Step 5: the dye stops crossing the bus, and gets its own grid
+
+§11 ended by naming the readback as the next thing to go, and observing that
+only the DRAW truly needed the dye on the host. That turned out to be half
+true. The dye was crossing in BOTH directions and for two independent reasons,
+and neither could be fixed alone:
+
+- **Up**, because the scene's dye source was a closure — `(g, dye, dt) => void`
+  — and a closure can only run where `Fields.dye` lives.
+- **Down**, because `Heatmap.drawRGB` looped over every cell in JavaScript to
+  fill an `ImageData` and let `drawImage` upscale it.
+
+At 1920x1080 that is ~25 MB each way per frame, plus ~5M byte writes on the
+main thread. So: `core/dye.ts` replaces the closure with a DESCRIPTION that a
+host loop and a compute kernel can both consume, and `viz/dyeGpu.ts` draws the
+picture from the buffer the step already leaves it in.
+
+### The source, as data
+
+The key observation is that every emitter in `scenes/` was already the same
+thing: **a fixed rectangle of prescribed values, re-imposed every step** — a
+Dirichlet condition on the tracer, which `emitters.ts` had said in a comment
+for a long time without anything depending on it. Nothing about it varies with
+`t` or `dt`. So a `DyeSource` is now `(dg, g) => DyePatch`, built once per
+reset and uploaded once.
+
+The one wrinkle is that a patch has to be able to write only PART of its
+rectangle. `wallJet` skips the rows outside its band, and it has to: those rows
+are ordinary fluid the recirculation carries dye into, and writing black over
+them every step would scrub it away. `karmanBands` is the opposite — the whole
+left edge is inflow there, and §-the-long-comment-in-karman.ts explains what
+went wrong when those rows were left unwritten. One coverage plane alongside
+the three value planes settles both: the apply is a lerp, so 1 overwrites, 0
+leaves the cell alone, and a tapered edge is free.
+
+### Rendering
+
+One oversized clip-space triangle and a fragment shader that indexes the
+resident dye buffer, on a SECOND canvas — a canvas gets exactly one context for
+its lifetime, and the other three views are still `'2d'`. The two are stacked:
+the WebGPU one behind, the 2D one on top and cleared to transparent while the
+dye view is up, so the solids mask and the arrows keep working with no port at
+all. No texture, no sampler: the manual bilinear is ten lines and the dye grid
+is near display resolution anyway.
+
+### Which unlocks a dye grid of its own
+
+Once the dye never crosses, its SIZE stops being a bandwidth question, and
+`Simulation.dyeG` can be a refinement of `g`. Dye is passive, and every kernel
+that touches it already worked in world coordinates — `advect.wgsl`'s
+`carrierU`/`carrierV` were never told which grid the caller sat on — so the
+shader change is `dnx/dny/dh` in `Params`, `idxD`, and a `dyeSolidOrOutside`
+that maps a dye cell's centre onto the coarse label grid. `advectScalar` takes
+the same trailing `dg`, defaulting to `g`, so every existing test is unchanged.
+
+The scale is pinned to the DISPLAY (`main.ts`'s `dyeScaleFor`), not set as a
+fixed multiplier. Rendering more dye cells than there are pixels is work nobody
+can see, so `floor(displayRows / ny)` is the natural cap and it makes the knob
+self-limiting: at 'very high' it returns 1 and nothing changes, and at 'medium'
+on a retina laptop it returns 2 — which is exactly the case where the old path
+was upscaling a 600-row picture onto an 1800-pixel canvas and the blur was
+being read as numerical diffusion.
+
+Capped at 2, because the carrier is bilinearly interpolated and so effectively
+band-limited at `g`: past ~2x the dye starts resolving the interpolation's own
+kinks rather than the flow. Whole numbers only, so the two grids cover exactly
+the same rectangle with no half-cell to reconcile at the outflow. Worth knowing
+if this is ever pushed further: the CFL is set on `g.h`, so at scale `s` the
+backtrace covers `s` times as many dye cells — stable either way, but
+MacCormack's clamp falls back to first order more often in the fast regions,
+and substepping the dye advection is the standard answer.
+
+### Measured
+
+karman, MacCormack, apple/metal-3, headless Chrome. Two windows, because the
+two halves of this show up in different places.
+
+**1920x1080, 'very high' (2213x1080)** — `dyeScaleFor` returns 1 here, so this
+isolates residency with the grid held fixed:
+
+|            | before | after |
+| ---------- | ------ | ----- |
+| upload     | 1.0 ms | 0.0   |
+| round trip | 12.8   | 6.4   |
+| draw       | 11.2   | 9.2   |
+| frame      | 63.3   | 61.5  |
+
+**1920x1440, 'medium' (888x600)** — `dyeScaleFor` returns 2, so "after" is
+carrying **four times the dye cells** (1776x1200):
+
+|           | before    | after     |
+| --------- | --------- | --------- |
+| upload    | 1.7 ms    | 0.0       |
+| on-device | 8.8–9.3   | 10.5–11.7 |
+| draw      | 2.5       | 1.8       |
+| frame     | 18.8–19.0 | 17.1–19.0 |
+
+That second table is the point: 4x the tracer resolution for about the same
+frame, because what the extra dye advection costs on-device is roughly what the
+upload and the JavaScript blit were costing anyway. The ratio is why it works —
+the pressure solve is a dozen-odd passes over the fine grid and dye advection
+is one, so refining the tracer alone is a fraction of what refining the whole
+simulation would be.
+
+The on-device number goes UP by ~2 ms, and about half of that is not the extra
+advection: `stepGpu` folds the advected dye back over `dyeIn` with a
+`copyBufferToBuffer`, the same trick the velocity already used, rather than
+threading a ping-pong flag through ten bind groups. That is a deliberate trade
+and it is the first thing to revisit if this shows up in a profile.
+
+### Correctness
+
+`advect.gputest.ts` now runs each scheme at dye scale 1 AND 2 against
+`CpuAdvector` — the second is what pins the half-cells and strides that only
+exist once the two grids come apart (2.6e-6 relative on dye, against a ~1e-7
+f32 floor). `project.gputest.ts` grew `dye_patch`, diffed against
+`applyDyePatch` — that kernel is the ONLY copy of an emitter that runs on the
+device, and its host twin is what the CPU engine runs, so the two drifting
+would show up as the same scene looking different on the two engines.
+
+The one new piece of state to know about: while the fused path drives, the
+DEVICE holds the authoritative dye and `f.dye` is whatever `reset()` last
+wrote. `GpuStep.readDye` is how it comes back, and `main.ts` calls it in
+exactly one place — `applyEngineDeferred`, at a frame boundary, when the fused
+path is being switched away from. That is also why engine and solver changes
+are now queued like scene changes are (§11's `pendingRebuild` note): the
+readback is async and an event handler is the wrong place for it.

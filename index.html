@@ -14,7 +14,16 @@
     <!-- The canvas IS the page: fixed to the whole viewport, and sized in
          device pixels by main.ts. There is no layout to measure and nothing
          for the chrome to push around — every control floats over it inside
-         #ui, which is transparent to the pointer except where a widget is. -->
+         #ui, which is transparent to the pointer except where a widget is.
+
+         TWO canvases, stacked, because a canvas gets exactly one context for
+         its lifetime. #dye takes a 'webgpu' context and shows the dye view
+         straight from the device buffer (viz/dyeGpu.ts); #view keeps its '2d'
+         context for the three analysis views, and while the dye view is up it
+         is cleared to transparent and carries only the solids mask and the
+         arrows. #view is on top and #dye is hidden unless it is driving, so
+         nothing about the other views changes. -->
+    <canvas id="dye" hidden></canvas>
     <canvas id="view"></canvas>
     <div id="ui"></div>
     <script type="module" src="/src/main.ts"></script>

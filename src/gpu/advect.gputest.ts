@@ -12,13 +12,20 @@
  *
  * The reference is the CPU advector, so a failure here is the shader or the
  * plumbing, never the scheme: core/advect.test.ts already pins the scheme.
+ *
+ * Run at TWO dye scales. At 1 the dye grid is the velocity grid and this is
+ * the test it always was. At 2 they come apart — advect_dye and correct_dye
+ * index a different array with a different h and map their own cell centres
+ * onto the coarse label grid, while carrierU/carrierV keep reading the coarse
+ * velocity — and every one of those is a place a half-cell or a stride can go
+ * wrong in a way that still produces a plausible-looking flow.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import type { AdvectionScheme } from '../core/advect.ts';
 import { CpuAdvector } from '../core/advector.ts';
-import { Cell, createFields, createGrid, idxP, idxU, idxV } from '../core/grid.ts';
+import { Cell, createFields, createGrid, idxP, idxU, idxV, type Grid } from '../core/grid.ts';
 import { evalInBrowser, NoBrowserError } from './chromeHarness.ts';
 
 const WGSL = readFileSync(new URL('./advect.wgsl', import.meta.url), 'utf8');
@@ -35,8 +42,13 @@ const DT = (1.5 * G.h) / 1.2;
  * run exercises the solid copy-through branch, the off-grid-as-wall branch,
  * and a backtrace that clamps against the domain edge.
  */
-function fixture() {
-  const f = createFields(G, Float64Array);
+/** The dye grid at a given whole-number refinement — Simulation.dyeG's rule. */
+function dyeGrid(scale: number): Grid {
+  return scale === 1 ? G : createGrid(NX * scale, NY * scale, 1 / (NY * scale));
+}
+
+function fixture(dg: Grid) {
+  const f = createFields(G, Float64Array, dg);
   for (let j = 0; j < NY; j++) {
     for (let i = 0; i <= NX; i++) {
       const x = i * G.h;
@@ -56,13 +68,18 @@ function fixture() {
     for (let i = 10; i < 16; i++) f.label[idxP(G, i, j)] = Cell.Solid;
   }
   // Sharp-edged dye: a smooth blob would hide a MacCormack limiter that never
-  // bites, and the limiter is the fiddliest part of the kernel.
-  for (let j = 0; j < NY; j++) {
-    for (let i = 0; i < NX; i++) {
-      const k = idxP(G, i, j);
-      f.dye[0][k] = i < NX / 2 ? 1 : 0;
-      f.dye[1][k] = (i + j) % 7 < 3 ? 0.8 : 0.1;
-      f.dye[2][k] = j > NY / 3 ? 0.5 : 0;
+  // bites, and the limiter is the fiddliest part of the kernel. Written in
+  // WORLD coordinates so the pattern is the same picture at either dye scale —
+  // a fixture keyed to cell indices would change shape with the refinement and
+  // the two runs would not be comparable.
+  for (let j = 0; j < dg.ny; j++) {
+    for (let i = 0; i < dg.nx; i++) {
+      const k = idxP(dg, i, j);
+      const x = (i + 0.5) * dg.h;
+      const y = (j + 0.5) * dg.h;
+      f.dye[0][k] = x < 0.5 * NX * G.h ? 1 : 0;
+      f.dye[1][k] = (Math.floor(x / G.h) + Math.floor(y / G.h)) % 7 < 3 ? 0.8 : 0.1;
+      f.dye[2][k] = y > (NY / 3) * G.h ? 0.5 : 0;
     }
   }
   return f;
@@ -79,11 +96,14 @@ function pageScript(
   dye: Float64Array[],
   label: Uint8Array,
   mac: boolean,
+  dg: Grid,
 ): string {
   const nums = (a: ArrayLike<number>) => JSON.stringify(Array.from(a));
   return `(async () => {
   const nx = ${NX}, ny = ${NY}, h = ${G.h}, dt = ${DT}, mac = ${mac};
-  const cells = nx * ny, uLen = (nx + 1) * ny, vLen = nx * (ny + 1), dyeLen = 3 * cells;
+  const dnx = ${dg.nx}, dny = ${dg.ny}, dh = ${dg.h};
+  const cells = nx * ny, uLen = (nx + 1) * ny, vLen = nx * (ny + 1);
+  const dyeCells = dnx * dny, dyeLen = 3 * dyeCells;
   if (!navigator.gpu) return { skip: 'navigator.gpu missing (secure context? headless flags?)' };
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) return { skip: 'no GPU adapter' };
@@ -112,19 +132,23 @@ function pageScript(
   const dA = buf(dyeLen, OUT), dB = buf(dyeLen, OUT);
   const READ = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
   const velRead = buf(uLen + vLen, READ), dyeRead = buf(dyeLen, READ);
-  const params = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
-  const ab = new ArrayBuffer(16);
+  // 32 bytes, matching PARAMS_BYTES in advectGpu.ts: nx, ny, h, dt, then the
+  // dye grid's dnx, dny, dh.
+  const ab = new ArrayBuffer(32);
   new Uint32Array(ab, 0, 2).set([nx, ny]);
   new Float32Array(ab, 8, 2).set([h, dt]);
+  new Uint32Array(ab, 16, 2).set([dnx, dny]);
+  new Float32Array(ab, 24, 1).set([dh]);
   device.queue.writeBuffer(params, 0, ab);
   device.queue.writeBuffer(uIn, 0, new Float32Array(${nums(u)}));
   device.queue.writeBuffer(vIn, 0, new Float32Array(${nums(v)}));
   device.queue.writeBuffer(lab, 0, new Uint32Array(${nums(label)}));
   const dyeFlat = new Float32Array(dyeLen);
   dyeFlat.set(new Float32Array(${nums(dye[0])}), 0);
-  dyeFlat.set(new Float32Array(${nums(dye[1])}), cells);
-  dyeFlat.set(new Float32Array(${nums(dye[2])}), 2 * cells);
+  dyeFlat.set(new Float32Array(${nums(dye[1])}), dyeCells);
+  dyeFlat.set(new Float32Array(${nums(dye[2])}), 2 * dyeCells);
   device.queue.writeBuffer(dyeIn, 0, dyeFlat);
 
   const group = (src, orig, dst) => device.createBindGroup({ layout, entries: [
@@ -142,11 +166,11 @@ function pageScript(
   };
   go('advect_u', group(uIn, uIn, uA), nx + 1, ny);
   go('advect_v', group(vIn, vIn, vA), nx, ny + 1);
-  go('advect_dye', group(dyeIn, dyeIn, dA), nx, ny);
+  go('advect_dye', group(dyeIn, dyeIn, dA), dnx, dny);
   if (mac) {
     go('correct_u', group(uA, uIn, uB), nx + 1, ny);
     go('correct_v', group(vA, vIn, vB), nx, ny + 1);
-    go('correct_dye', group(dA, dyeIn, dB), nx, ny);
+    go('correct_dye', group(dA, dyeIn, dB), dnx, dny);
   }
   pass.end();
   enc.copyBufferToBuffer(mac ? uB : uA, 0, velRead, 0, uLen * 4);
@@ -193,57 +217,62 @@ function compare(expected: ArrayLike<number>, actual: ArrayLike<number>): [numbe
 }
 
 for (const scheme of ['semiLagrangian', 'macCormack'] as AdvectionScheme[]) {
-  test(`advect.wgsl reproduces CpuAdvector (${scheme})`, async (t) => {
-    const f = fixture();
+  for (const dyeScale of [1, 2]) {
+    test(`advect.wgsl reproduces CpuAdvector (${scheme}, dye x${dyeScale})`, async (t) => {
+      const dg = dyeGrid(dyeScale);
+      const f = fixture(dg);
 
-    let res: PageResult;
-    try {
-      res = (await evalInBrowser(
-        pageScript(
-          f.u as Float64Array,
-          f.v as Float64Array,
-          f.dye as Float64Array[],
-          f.label,
-          scheme === 'macCormack',
-        ),
-      )) as PageResult;
-    } catch (e) {
-      // No Chrome is a legitimate environment, not a failing shader.
-      if (e instanceof NoBrowserError) return t.skip(e.message.split('\n')[0]);
-      throw e;
-    }
-    if (res.skip) return t.skip(res.skip);
-    assert.equal(res.validation, null, `WebGPU validation error: ${res.validation}`);
-    assert.deepEqual(res.diagnostics, [], 'shader compiled with diagnostics');
+      let res: PageResult;
+      try {
+        res = (await evalInBrowser(
+          pageScript(
+            f.u as Float64Array,
+            f.v as Float64Array,
+            f.dye as Float64Array[],
+            f.label,
+            scheme === 'macCormack',
+            dg,
+          ),
+        )) as PageResult;
+      } catch (e) {
+        // No Chrome is a legitimate environment, not a failing shader.
+        if (e instanceof NoBrowserError) return t.skip(e.message.split('\n')[0]);
+        throw e;
+      }
+      if (res.skip) return t.skip(res.skip);
+      assert.equal(res.validation, null, `WebGPU validation error: ${res.validation}`);
+      assert.deepEqual(res.diagnostics, [], 'shader compiled with diagnostics');
 
-    const cpu = new CpuAdvector(G);
-    const uOut = new Float64Array(f.u.length);
-    const vOut = new Float64Array(f.v.length);
-    const dyeOut = f.dye.map((c) => new Float64Array(c.length));
-    cpu.velocity(G, scheme, f.u, f.v, uOut, vOut, f.label, DT);
-    // The same carrier the page used: the real step advects dye with the
-    // PROJECTED velocity, but there is no projection here and the kernel
-    // cannot tell the difference.
-    cpu.dye(G, scheme, f.u, f.v, f.dye, dyeOut, f.label, DT);
+      const cpu = new CpuAdvector(G, dg);
+      const uOut = new Float64Array(f.u.length);
+      const vOut = new Float64Array(f.v.length);
+      const dyeOut = f.dye.map((c) => new Float64Array(c.length));
+      cpu.velocity(G, scheme, f.u, f.v, uOut, vOut, f.label, DT);
+      // The same carrier the page used: the real step advects dye with the
+      // PROJECTED velocity, but there is no projection here and the kernel
+      // cannot tell the difference.
+      cpu.dye(G, scheme, f.u, f.v, f.dye, dyeOut, f.label, DT, dg);
 
-    const dyeFlat = new Float64Array(3 * NX * NY);
-    for (let c = 0; c < 3; c++) dyeFlat.set(dyeOut[c], c * NX * NY);
+      const dyeCells = dg.nx * dg.ny;
+      const dyeFlat = new Float64Array(3 * dyeCells);
+      for (let c = 0; c < 3; c++) dyeFlat.set(dyeOut[c], c * dyeCells);
 
-    const cases: [string, Float64Array, number[]][] = [
-      ['u', uOut, res.u ?? []],
-      ['v', vOut, res.v ?? []],
-      ['dye', dyeFlat, res.dye ?? []],
-    ];
-    const report: string[] = [];
-    for (const [name, expected, got] of cases) {
-      assert.equal(got.length, expected.length, `${name}: wrong element count came back`);
-      const [diff, peak] = compare(expected, got);
-      assert.ok(peak > 1e-3, `${name}: test is vacuous, the field is ~0`);
-      // 1e-5 relative: f32 on the device against f64 on the host puts the
-      // floor near 1e-7, and a real plumbing bug misses by orders more.
-      assert.ok(diff < 1e-5 * peak, `${name}: GPU differs by ${diff} on a peak of ${peak}`);
-      report.push(`${name} ${(diff / peak).toExponential(1)}`);
-    }
-    t.diagnostic(`adapter ${res.adapter}  relative diff: ${report.join('  ')}`);
-  });
+      const cases: [string, Float64Array, number[]][] = [
+        ['u', uOut, res.u ?? []],
+        ['v', vOut, res.v ?? []],
+        ['dye', dyeFlat, res.dye ?? []],
+      ];
+      const report: string[] = [];
+      for (const [name, expected, got] of cases) {
+        assert.equal(got.length, expected.length, `${name}: wrong element count came back`);
+        const [diff, peak] = compare(expected, got);
+        assert.ok(peak > 1e-3, `${name}: test is vacuous, the field is ~0`);
+        // 1e-5 relative: f32 on the device against f64 on the host puts the
+        // floor near 1e-7, and a real plumbing bug misses by orders more.
+        assert.ok(diff < 1e-5 * peak, `${name}: GPU differs by ${diff} on a peak of ${peak}`);
+        report.push(`${name} ${(diff / peak).toExponential(1)}`);
+      }
+      t.diagnostic(`adapter ${res.adapter}  relative diff: ${report.join('  ')}`);
+    });
+  }
 }

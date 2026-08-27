@@ -20,7 +20,8 @@
  * reaches it. An open boundary lets the flow choose its own way out.
  */
 
-import { idxP, idxU, type Grid } from '../core/grid.ts';
+import { inDyeCells, makeDyePatch } from '../core/dye.ts';
+import { idxU, type Grid } from '../core/grid.ts';
 import type { DyeSource, Seed } from '../core/simulation.ts';
 
 /** smoothstep, clamped. */
@@ -86,15 +87,19 @@ export function wallJet(options: Partial<WallJetOptions> = {}): {
   // 0.7% difference in the whole field after 600 steps), so the weight was
   // complexity with no effect. Overwriting is what makes a source a Dirichlet
   // condition on dye, and keeps it in [0, 1] with no clamp.
-  const source: DyeSource = (g, dye) => {
-    const depth = Math.min(depthCells, g.nx);
-    for (let j = 0; j < g.ny; j++) {
-      if (weight(g, j) <= 0) continue;
-      for (let i = 0; i < depth; i++) {
-        const k = idxP(g, i, j);
-        for (let c = 0; c < dye.length; c++) dye[c][k] = colour[c];
-      }
-    }
+  //
+  // Coverage 0 outside the band, NOT a colour of 0: the rows above and below
+  // the nozzle are ordinary fluid the recirculation carries dye into, and
+  // writing black over them every step would scrub it away. (Contrast
+  // karmanBands, where the whole left edge is inflow and writing every row is
+  // the point.)
+  const source: DyeSource = (dg, g) => {
+    const depth = Math.min(inDyeCells(depthCells, g, dg), dg.nx);
+    return makeDyePatch(0, 0, depth, dg.ny, (_i, j, rgb) => {
+      if (weight(dg, j) <= 0) return 0;
+      for (let c = 0; c < rgb.length; c++) rgb[c] = colour[c];
+      return 1;
+    });
   };
 
   return { seed, source };

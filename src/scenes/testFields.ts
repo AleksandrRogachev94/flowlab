@@ -23,6 +23,7 @@
  */
 
 import { idxP, idxU, idxV, type FieldArray, type Grid } from '../core/grid.ts';
+import { inDyeCells, makeDyePatch } from '../core/dye.ts';
 import type { DyeSource } from '../core/simulation.ts';
 
 const PI = Math.PI;
@@ -256,16 +257,23 @@ export interface StripeOptions {
  *  all "how the line looks", and at a call site `2, 0.4, SMOKE` says nothing. */
 export function stripeInflow(options: StripeOptions = {}): DyeSource {
   const { periodCells = 12, duty = 0.4, depthCells = 2, tint } = options;
-  return (g, dye) => {
-    const depth = Math.min(depthCells, g.nx);
-    for (let j = 0; j < g.ny; j++) {
-      const ribbon = ribbonAt(g, j, periodCells, duty);
-      for (let c = 0; c < dye.length; c++) {
-        const v = ribbon * (tint ? tint[c] : hueAt(g, j, c, dye.length));
-        for (let i = 0; i < depth; i++) dye[c][idxP(g, i, j)] = v;
+  // Both lengths are quoted in VELOCITY cells and both are really distances,
+  // so both convert: the rake's line SPACING must not halve when the dye grid
+  // is refined. The ramp inside ribbonAt stays one DYE cell wide, which is
+  // what its own comment asks for — the aliasing it guards against is at
+  // whichever grid the dye is actually stored on.
+  //
+  // Coverage 1 on every row, gaps included: those zeros are the clean fluid
+  // between the lines arriving, and they are as much a boundary condition as
+  // the lines are. See the long note on karmanBands.
+  return (dg, g) =>
+    makeDyePatch(0, 0, Math.min(inDyeCells(depthCells, g, dg), dg.nx), dg.ny, (_i, j, rgb) => {
+      const ribbon = ribbonAt(dg, j, inDyeCells(periodCells, g, dg), duty);
+      for (let c = 0; c < rgb.length; c++) {
+        rgb[c] = ribbon * (tint ? tint[c] : hueAt(dg, j, c, rgb.length));
       }
-    }
-  };
+      return 1;
+    });
 }
 
 /**

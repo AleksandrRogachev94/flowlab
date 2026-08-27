@@ -222,6 +222,21 @@ export function advectVelocityMacCormack(
  *
  * NOT in-place (Rule 2). Solid cells copy through as in advectVelocity, since
  * qOut is a separate ping-pong buffer and skipping them leaves stale data.
+ *
+ * @param dg the DYE grid — the one q lives on, which need not be the velocity
+ *           grid `g`. Everything here is already in WORLD coordinates, so the
+ *           split is small and mechanical: `dg` decides where this thread sits
+ *           and how q is indexed and interpolated, `g` decides the carrier
+ *           velocity and the labels. Defaults to `g`, which is the identity
+ *           and what every test and the CPU-only path use.
+ *
+ *           Refining the dye alone buys the tracer resolution to HOLD a thin
+ *           filament that the velocity field is stretching; it does not invent
+ *           structure, because bilinear interpolation makes the carrier
+ *           effectively band-limited at `g`. Note also that the CFL is set on
+ *           `g.h` (see Simulation.step), so at dyeScale s the backtrace covers
+ *           s times as many dye cells — stable either way, but MacCormack's
+ *           clamp falls back to first order more often in the fast regions.
  */
 export function advectScalar(
   g: Grid,
@@ -231,14 +246,17 @@ export function advectScalar(
   qOut: FieldArray,
   label: Uint8Array,
   dt: number,
+  dg: Grid = g,
 ): void {
-  const h = g.h;
+  const h = dg.h;
+  const ratio = dg.h / g.h;
 
-  for (let j = 0; j < g.ny; j++) {
+  for (let j = 0; j < dg.ny; j++) {
     const y = (j + 0.5) * h;
-    for (let i = 0; i < g.nx; i++) {
-      const k = idxP(g, i, j);
-      if (isSolidOrOutside(g, label, i, j)) {
+    const lj = Math.floor((j + 0.5) * ratio);
+    for (let i = 0; i < dg.nx; i++) {
+      const k = idxP(dg, i, j);
+      if (isSolidOrOutside(g, label, Math.floor((i + 0.5) * ratio), lj)) {
         qOut[k] = qIn[k];
         continue;
       }
@@ -246,7 +264,7 @@ export function advectScalar(
       // Both stages interpolate both components: a cell center stores neither
       // u nor v, where advectVelocity gets one of them exact for free.
       backtrace(g, u, v, x, y, sampleU(g, u, x, y), sampleV(g, v, x, y), dt);
-      qOut[k] = sampleP(g, qIn, back.x, back.y);
+      qOut[k] = sampleP(dg, qIn, back.x, back.y);
     }
   }
 }
@@ -268,24 +286,27 @@ export function advectScalarMacCormack(
   qOut: FieldArray,
   label: Uint8Array,
   dt: number,
+  dg: Grid = g,
 ): void {
-  advectScalar(g, u, v, qIn, qHat, label, dt);
-  advectScalar(g, u, v, qHat, qOut, label, -dt);
+  advectScalar(g, u, v, qIn, qHat, label, dt, dg);
+  advectScalar(g, u, v, qHat, qOut, label, -dt, dg);
 
-  const h = g.h;
+  const h = dg.h;
+  const ratio = dg.h / g.h;
 
-  for (let j = 0; j < g.ny; j++) {
+  for (let j = 0; j < dg.ny; j++) {
     const y = (j + 0.5) * h;
-    for (let i = 0; i < g.nx; i++) {
-      const k = idxP(g, i, j);
-      if (isSolidOrOutside(g, label, i, j)) {
+    const lj = Math.floor((j + 0.5) * ratio);
+    for (let i = 0; i < dg.nx; i++) {
+      const k = idxP(dg, i, j);
+      if (isSolidOrOutside(g, label, Math.floor((i + 0.5) * ratio), lj)) {
         qOut[k] = qIn[k];
         continue;
       }
       const x = (i + 0.5) * h;
       const corrected = qHat[k] + 0.5 * (qIn[k] - qOut[k]);
       backtrace(g, u, v, x, y, sampleU(g, u, x, y), sampleV(g, v, x, y), dt);
-      qOut[k] = clampToStencilP(g, qIn, back.x, back.y, corrected);
+      qOut[k] = clampToStencilP(dg, qIn, back.x, back.y, corrected);
     }
   }
 }

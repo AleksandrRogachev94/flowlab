@@ -78,7 +78,13 @@ export interface Fields {
   u: FieldArray;
   v: FieldArray;
   label: Uint8Array;
-  /** DYE_CHANNELS cell-centered scalars, each nx * ny. */
+  /**
+   * DYE_CHANNELS cell-centered scalars on the DYE grid, which is the velocity
+   * grid by default and a refinement of it when Simulation is built with a
+   * dyeScale above 1 — dye is passive, so nothing in the solve cares. Each is
+   * dyeG.nx * dyeG.ny, NOT g.nx * g.ny; anything indexing them must carry the
+   * dye grid rather than reach for `g`.
+   */
   dye: FieldArray[];
 }
 
@@ -91,13 +97,13 @@ export function createGrid(nx: number, ny: number, h: number): Grid {
  * cell starts labeled Cell.Fluid (0) — solid walls and boundaries are set
  * up later by scenario code (Step 3), not here.
  */
-export function createFields(g: Grid, ctor: FieldCtor): Fields {
+export function createFields(g: Grid, ctor: FieldCtor, dyeG: Grid = g): Fields {
   return {
     p: new ctor(g.nx * g.ny),
     u: new ctor((g.nx + 1) * g.ny),
     v: new ctor(g.nx * (g.ny + 1)),
     label: new Uint8Array(g.nx * g.ny),
-    dye: Array.from({ length: DYE_CHANNELS }, () => new ctor(g.nx * g.ny)),
+    dye: Array.from({ length: DYE_CHANNELS }, () => new ctor(dyeG.nx * dyeG.ny)),
   };
 }
 

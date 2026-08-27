@@ -43,13 +43,31 @@ body {
 /* Full viewport, no letterbox: main.ts picks the GRID to match this box's
    aspect, so the simulation domain and the window are the same shape and the
    canvas can simply fill it. */
-#view {
+/* Both canvases fill the viewport exactly, so they register pixel for pixel.
+   Only the back one paints a background: the front one is transparent
+   wherever the dye view has left it cleared. */
+#view,
+#dye {
   position: fixed;
   inset: 0;
   width: 100%;
   height: 100%;
   display: block;
+}
+
+#dye {
   background: #000;
+}
+
+/* Opaque in every view but 'dye', where FieldView clears it instead — see
+   index.html. `background: #000` here would hide #dye entirely. */
+#view {
+  background: transparent;
+}
+
+/* The page behind both, so a frame with neither painted is not white. */
+#dye[hidden] {
+  display: none;
 }
 
 /* The chrome layer. Transparent to the pointer so a click lands on the canvas

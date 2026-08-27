@@ -34,8 +34,9 @@ import shaderSource from './advect.wgsl?raw';
 /** Threads per workgroup, one axis. MUST match @workgroup_size in advect.wgsl. */
 const WORKGROUP = 8;
 
-/** nx, ny, h, dt — exactly 16 bytes, so no padding is needed. */
-const PARAMS_BYTES = 16;
+/** nx, ny, h, dt, then the dye grid's dnx, dny, dh and one pad word — see the
+ *  Params struct in advect.wgsl. */
+const PARAMS_BYTES = 32;
 
 /** Entry points, in the order a MacCormack step dispatches them. */
 const ENTRY_POINTS = [
@@ -57,6 +58,9 @@ export class GpuAdvector implements Advector {
   private readonly nx: number;
   private readonly ny: number;
   private readonly h: number;
+  /** The DYE grid — `g` unless the caller passed a refinement. Everything
+   *  named `dye*` below is sized by THIS, not by nx/ny. */
+  readonly dg: Grid;
   readonly uLen: number;
   readonly vLen: number;
   readonly dyeLen: number;
@@ -109,16 +113,18 @@ export class GpuAdvector implements Advector {
   constructor(
     private readonly ctx: GpuContext,
     g: Grid,
+    dg: Grid = g,
   ) {
     const { device } = ctx;
     this.device = device;
     this.nx = g.nx;
     this.ny = g.ny;
     this.h = g.h;
+    this.dg = dg;
     const cells = g.nx * g.ny;
     this.uLen = (g.nx + 1) * g.ny;
     this.vLen = g.nx * (g.ny + 1);
-    this.dyeLen = DYE_CHANNELS * cells;
+    this.dyeLen = DYE_CHANNELS * dg.nx * dg.ny;
     this.uBytes = this.uLen * 4;
     this.vBytes = this.vLen * 4;
 
@@ -136,7 +142,10 @@ export class GpuAdvector implements Advector {
     // the projected field in these buffers and reads THEM back, not A/B.
     this.uIn = buffer('u-in', this.uLen, input | GPUBufferUsage.COPY_SRC);
     this.vIn = buffer('v-in', this.vLen, input | GPUBufferUsage.COPY_SRC);
-    this.dyeIn = buffer('dye-in', this.dyeLen, input);
+    // COPY_SRC on dye-in for the same reason as the velocity inputs: under the
+    // fused stepper this buffer IS the dye between frames, so it is what the
+    // step copies the advection's result back into and what readDye() reads.
+    this.dyeIn = buffer('dye-in', this.dyeLen, input | GPUBufferUsage.COPY_SRC);
     this.labelBuf = buffer('label', cells, input);
     this.uA = buffer('u-hat', this.uLen, output);
     this.uB = buffer('u-out', this.uLen, output);
@@ -271,6 +280,11 @@ export class GpuAdvector implements Advector {
     label: Uint8Array,
     dt: number,
   ): Promise<void> {
+    // `dg` is not a parameter here: the dye buffers ARE their size, fixed at
+    // construction, so the grid was settled before this call. The Advector
+    // signature carries one for the CPU implementation, which allocates
+    // nothing and can be told per call.
+    const dyeCells = this.dg.nx * this.dg.ny;
     if (this.ctx.lost) throw new Error('GPU device lost');
     const { queue } = this.device;
     // u and v again, because the host projected them since velocity() ran.
@@ -282,7 +296,7 @@ export class GpuAdvector implements Advector {
     }
     this.uHost.set(u);
     this.vHost.set(v);
-    for (let c = 0; c < qIn.length; c++) this.dyeHost.set(qIn[c], c * this.nx * this.ny);
+    for (let c = 0; c < qIn.length; c++) this.dyeHost.set(qIn[c], c * dyeCells);
     queue.writeBuffer(this.uIn, 0, this.uHost);
     queue.writeBuffer(this.vIn, 0, this.vHost);
     queue.writeBuffer(this.dyeIn, 0, this.dyeHost);
@@ -298,9 +312,8 @@ export class GpuAdvector implements Advector {
 
     await this.dyeRead.mapAsync(GPUMapMode.READ);
     const mapped = this.dyeRead.getMappedRange();
-    const cells = this.nx * this.ny;
     for (let c = 0; c < qOut.length; c++) {
-      qOut[c].set(new Float32Array(mapped, c * cells * 4, cells));
+      qOut[c].set(new Float32Array(mapped, c * dyeCells * 4, dyeCells));
     }
     this.dyeRead.unmap();
   }
@@ -325,8 +338,8 @@ export class GpuAdvector implements Advector {
   /** The dye dispatches — one for all three channels: they share the
    *  backtrace. Result in dyeA (semiLagrangian) or dyeB (macCormack). */
   recordDye(pass: GPUComputePassEncoder, mac: boolean): void {
-    this.dispatch(pass, 'advect_dye', this.bind.dFwd, this.nx, this.ny);
-    if (mac) this.dispatch(pass, 'correct_dye', this.bind.dCor, this.nx, this.ny);
+    this.dispatch(pass, 'advect_dye', this.bind.dFwd, this.dg.nx, this.dg.ny);
+    if (mac) this.dispatch(pass, 'correct_dye', this.bind.dCor, this.dg.nx, this.dg.ny);
   }
 
   /** Bounds-guarded in the shader, so overshooting the field is safe. */
@@ -347,6 +360,9 @@ export class GpuAdvector implements Advector {
     this.paramsU32[1] = this.ny;
     this.paramsF32[2] = this.h;
     this.paramsF32[3] = dt;
+    this.paramsU32[4] = this.dg.nx;
+    this.paramsU32[5] = this.dg.ny;
+    this.paramsF32[6] = this.dg.h;
     this.device.queue.writeBuffer(this.paramsBuf, 0, this.paramsData);
   }
 

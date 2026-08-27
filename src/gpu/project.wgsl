@@ -19,10 +19,28 @@ struct Params {
   // dt / (rho * h) — subtractGradient's conversion of a pressure difference
   // into a velocity change.
   gradScale: f32,
+};
+
+/**
+ * The dye kernels' own uniform, separate from Params because the dye no longer
+ * lives on the velocity grid: nx/ny here are the DYE grid's (see advect.wgsl's
+ * Params for the split), and the inlet rectangle below is in dye cells.
+ */
+struct DyeParams {
+  nx: u32,
+  ny: u32,
   // exp(-dyeDecay * dt): the fade the host used to apply in its own loop over
   // every dye cell. 1 when the scene has no decay, and then the host skips the
   // dispatch entirely rather than multiplying 6M floats by one.
-  dyeKeep: f32,
+  keep: f32,
+  // The scene's inlet, uploaded once per reset.
+  pi0: u32,
+  pj0: u32,
+  pnx: u32,
+  pny: u32,
+  // std140 rounds a uniform struct up to 16 bytes; naming the slot beats
+  // letting the layout do it silently.
+  pad: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -35,8 +53,15 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> v: array<f32>;
 // The multigrid's fine-level rhs, written by divergence().
 @group(0) @binding(5) var<storage, read_write> b: array<f32>;
-// The advector's dye INPUT, faded in place by decay() before it is advected.
+// The advector's dye INPUT, faded in place by decay() before it is advected —
+// and, under the fused stepper, the buffer that IS the dye between frames, so
+// the inlet kernel writes here too.
 @group(0) @binding(6) var<storage, read_write> dye: array<f32>;
+@group(0) @binding(7) var<uniform> dyeParams: DyeParams;
+// CHANNELS value planes then ONE coverage plane, each pnx*pny — core/dye.ts's
+// DyePatch, laid out exactly as it is on the host. Named `inlet` and not
+// `patch` because WGSL reserves that word.
+@group(0) @binding(8) var<storage, read> inlet: array<f32>;
 
 const AIR: u32 = 1u;
 const SOLID: u32 = 2u;
@@ -145,7 +170,36 @@ fn outflow(@builtin(global_invocation_id) gid: vec3<u32>) {
 // the 65535-per-dimension limit every adapter has.
 @compute @workgroup_size(8, 8)
 fn decay(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= params.nx || gid.y >= params.ny * CHANNELS) { return; }
-  let k = gid.x + gid.y * params.nx;
-  dye[k] = dye[k] * params.dyeKeep;
+  if (gid.x >= dyeParams.nx || gid.y >= dyeParams.ny * CHANNELS) { return; }
+  let k = gid.x + gid.y * dyeParams.nx;
+  dye[k] = dye[k] * dyeParams.keep;
+}
+
+// ---------------------------------------------------------------- dye source
+//
+// The scene's inlet, ported off the host for the same reason everything else
+// here was: the host is where `Fields.dye` lives, and running the source there
+// is what forced the whole field up the bus every frame — 25 MB at 1920x1080,
+// and four times that once the dye grid is refined. core/dye.ts has the
+// DyePatch description this consumes, and the host half, which must stay
+// arithmetically identical or the CPU and GPU engines drift at the inlet.
+
+/** applyDyePatch: a rectangle of prescribed dye, lerped in by its coverage
+ *  plane so a band emitter can leave the rows outside its band alone. */
+@compute @workgroup_size(8, 8)
+fn dye_patch(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= dyeParams.pnx || gid.y >= dyeParams.pny) { return; }
+  let di = dyeParams.pi0 + gid.x;
+  let dj = dyeParams.pj0 + gid.y;
+  if (di >= dyeParams.nx || dj >= dyeParams.ny) { return; }
+  let pcells = dyeParams.pnx * dyeParams.pny;
+  let s = gid.x + gid.y * dyeParams.pnx;
+  let cov = inlet[CHANNELS * pcells + s];
+  if (cov == 0.0) { return; }
+  let cells = dyeParams.nx * dyeParams.ny;
+  let k = di + dj * dyeParams.nx;
+  for (var c = 0u; c < CHANNELS; c++) {
+    let o = k + c * cells;
+    dye[o] += cov * (inlet[c * pcells + s] - dye[o]);
+  }
 }

@@ -11,6 +11,7 @@ import {
   type Fields,
   type Grid,
 } from './grid.ts';
+import { applyDyePatch, type DyePatch } from './dye.ts';
 import { Profiler } from './profiler.ts';
 import { cpuPressureSolver, type PressureSolver } from './pressureSolver.ts';
 import { subtractGradient } from './subtractGradient.ts';
@@ -41,8 +42,21 @@ export interface GpuStep {
     perf: Profiler,
   ): Promise<number>;
   /** Host fields changed under it (reset, frames on a CPU solver); the next
-   *  step() must re-upload u, v, p, label before trusting the device copy. */
+   *  step() must re-upload u, v, p, label AND dye before trusting the device
+   *  copy. */
   invalidate(): void;
+  /** The scene's dye inlet, re-imposed on the device every step. Constant in
+   *  time, so this is called once per reset rather than per frame. */
+  setDyePatch(patch: DyePatch | null): void;
+  /**
+   * Copies the device's dye into the host arrays.
+   *
+   * The fused path does NOT do this per frame — the renderer reads the device
+   * buffer directly, which is the whole reason the dye can stay resident — so
+   * the host mirror is stale for as long as this path is driving. Anything
+   * that needs it (a CPU solver taking over, the 2D dye view) has to ask.
+   */
+  readDye(dye: FieldArray[]): Promise<void>;
 }
 
 /** Writes an initial velocity field. Matches the scene helpers' signature. */
@@ -54,15 +68,24 @@ export type Seed = (g: Grid, u: FieldArray, v: FieldArray) => void;
  * with any velocity scene, and keeping the two apart lets them be mixed freely
  * — and lets the numerics tests seed velocity with no dye at all.
  */
-export type DyeSeed = (g: Grid, dye: FieldArray[]) => void;
+export type DyeSeed = (dg: Grid, dye: FieldArray[]) => void;
 
 /**
  * Re-imposed every step: a seed is initial data, a source is a boundary
- * condition on the tracer that advection keeps carrying away. `dt` is there
- * for sources that inject at a rate; one holding a region at a fixed value
- * ignores it.
+ * condition on the tracer that advection keeps carrying away.
+ *
+ * A factory for a DyePatch rather than a closure that writes the field, and
+ * the change is what lets the dye live on the device: a patch is a few
+ * kilobytes of rectangle that both a host loop and a compute kernel can
+ * consume, where a closure could only ever run on the host and so forced the
+ * whole dye field up the bus every frame. Every emitter in scenes/ was
+ * already a fixed rectangle of prescribed values — see core/dye.ts.
+ *
+ * Called with BOTH grids: `dg` is where the patch's cells live, `g` is what a
+ * thickness quoted "in cells inward from the wall" has always meant, and the
+ * two stop being the same grid at dyeScale > 1.
  */
-export type DyeSource = (g: Grid, dye: FieldArray[], dt: number) => void;
+export type DyeSource = (dg: Grid, g: Grid) => DyePatch;
 
 /**
  * Writes the Fluid/Air/Solid layout: obstacles, and open outlets. Runs BEFORE
@@ -173,6 +196,23 @@ export const defaultParams: SimulationParams = {
  */
 export class Simulation {
   readonly g: Grid;
+  /**
+   * The grid the dye lives on: `g` refined by the constructor's `dyeScale`.
+   *
+   * Dye is passive — it is carried by the velocity and feeds nothing back — so
+   * it is free to be resolved finer than the field carrying it, and that is
+   * the cheapest fidelity there is: the pressure solve is a dozen-odd passes
+   * per step and dye advection is one, so refining the tracer alone costs a
+   * fraction of what refining the whole simulation would.
+   *
+   * What it buys is the resolution to HOLD a filament the flow has stretched
+   * thin, instead of letting interpolation eat it — and, when the dye grid
+   * reaches the display's own resolution, an end to the upscale blur the 2D
+   * blit used to add on top. What it does NOT buy is new small-scale motion:
+   * the carrier is bilinearly interpolated and so effectively band-limited at
+   * `g`, which is why main.ts caps the scale at 2.
+   */
+  readonly dyeG: Grid;
   readonly f: Fields;
   /** Divergence remaining AFTER the last projection — the solver's residual. */
   readonly div: Float64Array;
@@ -222,7 +262,7 @@ export class Simulation {
   private dyeNext: FieldArray[];
 
   /** Set by reset(), so switching scenes can't leave an emitter running. */
-  private dyeSource: DyeSource | null = null;
+  private dyePatch: DyePatch | null = null;
 
   /**
    * `h = 1 / ny`, so the domain is always exactly ONE unit tall and nx/ny
@@ -245,15 +285,22 @@ export class Simulation {
     ny: number = nx,
     params: Partial<SimulationParams> = {},
     fieldCtor: FieldCtor = Float64Array,
+    /** Whole-number refinement of the dye grid — see `dyeG`. 1 is the old
+     *  behaviour and what every test and benchmark uses. Whole numbers only,
+     *  so the two grids cover exactly the same rectangle with no half-cell to
+     *  reconcile at the outflow edge. */
+    dyeScale = 1,
   ) {
     this.params = { ...defaultParams, omega: optimalOmega(nx, ny), ...params };
     this.g = createGrid(nx, ny, 1 / ny);
-    this.f = createFields(this.g, fieldCtor);
+    const s = Math.max(1, Math.round(dyeScale));
+    this.dyeG = s === 1 ? this.g : createGrid(nx * s, ny * s, 1 / (ny * s));
+    this.f = createFields(this.g, fieldCtor, this.dyeG);
     this.div = new Float64Array(this.f.p.length);
     this.uNext = new fieldCtor(this.f.u.length);
     this.vNext = new fieldCtor(this.f.v.length);
-    this.dyeNext = this.f.dye.map(() => new fieldCtor(this.f.p.length));
-    this.advector = new CpuAdvector(this.g);
+    this.dyeNext = this.f.dye.map(() => new fieldCtor(this.dyeG.nx * this.dyeG.ny));
+    this.advector = new CpuAdvector(this.g, this.dyeG);
   }
 
   /**
@@ -278,11 +325,15 @@ export class Simulation {
 
     scene.labels?.(g, f.label);
     scene.seed?.(g, f.u, f.v);
-    scene.dye?.(g, f.dye);
+    scene.dye?.(this.dyeG, f.dye);
     commitLabels(g, f);
 
-    this.dyeSource = scene.dyeSource ?? null;
-    this.dyeSource?.(g, f.dye, 0);
+    // Built once, not per step: an inlet is a fixed rectangle of prescribed
+    // values, and nothing about it depends on t or dt. Applied here at t = 0
+    // too, since a boundary condition on the tracer must already hold then.
+    this.dyePatch = scene.dyeSource?.(this.dyeG, g) ?? null;
+    if (this.dyePatch) applyDyePatch(this.dyeG, f.dye, this.dyePatch);
+    this.stepper?.setDyePatch(this.dyePatch);
     this.time = 0;
     this.dt = 0;
     this.uMax = null;
@@ -375,7 +426,7 @@ export class Simulation {
       //
       // Channels are fully independent — same velocity, no coupling — which is
       // what lets the GPU advector carry all three on one backtrace.
-      await this.advector.dye(g, p.scheme, f.u, f.v, f.dye, this.dyeNext, f.label, dt);
+      await this.advector.dye(g, p.scheme, f.u, f.v, f.dye, this.dyeNext, f.label, dt, this.dyeG);
       for (let c = 0; c < f.dye.length; c++) {
         [f.dye[c], this.dyeNext[c]] = [this.dyeNext[c], f.dye[c]];
       }
@@ -399,8 +450,9 @@ export class Simulation {
     }
 
     // After advection, not before: the source must hold its value at the END
-    // of the step, or the stamp is carried off within the same step.
-    this.dyeSource?.(g, f.dye, dt);
+    // of the step, or the inlet is carried off within the same step. Skipped
+    // under the fused stepper, which applies the same patch on the device.
+    if (this.dyePatch && !this.stepper) applyDyePatch(this.dyeG, f.dye, this.dyePatch);
     this.perf.mark('dye');
 
     this.dt = dt;

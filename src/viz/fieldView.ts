@@ -38,6 +38,15 @@ export interface ViewStats {
  *  allocated once (Rule 3). */
 export class FieldView {
   private readonly heatmap: Heatmap;
+  /**
+   * A second heatmap at the DYE grid's size, used by the dye view alone.
+   *
+   * Dye may be stored finer than the velocity field (Simulation.dyeG), and
+   * `heatmap` is one pixel per VELOCITY cell — feeding it dye-sized arrays
+   * would read the wrong rows. Two objects rather than one resized per view,
+   * because at dyeScale 1 they are the same size and this costs nothing.
+   */
+  private readonly dyeHeatmap: Heatmap;
   private readonly speed: Float64Array;
   private readonly vort: Float64Array;
   /** Cached solid-cell mask — see drawSolids. */
@@ -45,8 +54,9 @@ export class FieldView {
   private solidsW = 0;
   private solidsH = 0;
 
-  constructor(g: Grid) {
+  constructor(g: Grid, dg: Grid = g) {
     this.heatmap = new Heatmap(g.nx, g.ny);
+    this.dyeHeatmap = dg === g ? this.heatmap : new Heatmap(dg.nx, dg.ny);
     this.speed = new Float64Array(g.nx * g.ny);
     this.vort = new Float64Array(g.nx * g.ny);
   }
@@ -65,7 +75,20 @@ export class FieldView {
    * direction is the one thing a scalar field genuinely cannot show — a
    * recirculation bubble and a fast through-flow can render identically.
    */
-  draw(ctx: CanvasRenderingContext2D, sim: Simulation, view: View, arrows = false): ViewStats {
+  /**
+   * @param dyeOnDevice the dye view is being painted by viz/dyeGpu.ts onto the
+   *        WebGPU canvas UNDER this one, so this canvas must be cleared to
+   *        transparent rather than blitted over — it still carries the solids
+   *        mask and the arrows, which are the two overlays that are cheaper to
+   *        keep in 2D than to port.
+   */
+  draw(
+    ctx: CanvasRenderingContext2D,
+    sim: Simulation,
+    view: View,
+    arrows = false,
+    dyeOnDevice = false,
+  ): ViewStats {
     const { g, f, div } = sim;
 
     // FLUID cells only: an Air outlet is supposed to be divergent and a
@@ -130,11 +153,18 @@ export class FieldView {
         smooth: true,
       });
     } else if (view === 'dye') {
-      // Straight to RGB — see Heatmap.drawRGB. No colormap, and no
-      // normalization: dye is seeded at 1 and only dissipates, so the absolute
-      // brightness IS the measurement.
-      const [r, gr, b] = f.dye;
-      this.heatmap.drawRGB(r, gr, b, ctx, { smooth: true });
+      if (dyeOnDevice) {
+        // The picture is already on the canvas behind this one; anything drawn
+        // here would hide it. f.dye is stale in this case anyway — see
+        // GpuStep.readDye.
+        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      } else {
+        // Straight to RGB — see Heatmap.drawRGB. No colormap, and no
+        // normalization: dye is seeded at 1 and only dissipates, so the
+        // absolute brightness IS the measurement.
+        const [r, gr, b] = f.dye;
+        this.dyeHeatmap.drawRGB(r, gr, b, ctx, { smooth: true });
+      }
     } else {
       // coolwarm keeps its near-white zero here: the debug question is "is
       // anything nonzero", and specks of colour read fastest against white.

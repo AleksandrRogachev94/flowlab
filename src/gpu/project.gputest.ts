@@ -1,9 +1,15 @@
 /**
  * The correctness gate for project.wgsl, in the mould of the other two: run
- * divergence, subtract_u/subtract_v, outflow and decay on real hardware and
- * diff the results against their f64 CPU originals (computeDivergence,
- * subtractGradient, applyOutflow, and the dye fade Simulation.step applies) on
- * a fixture with an interior solid and an Air outlet column.
+ * every kernel in the file on real hardware and diff the results against their
+ * f64 CPU originals — computeDivergence, subtractGradient, applyOutflow, the
+ * dye fade Simulation.step applies, and core/dye.ts's applyDyePatch — on a
+ * fixture with an interior solid and an Air outlet column.
+ *
+ * The dye_patch kernel matters here more than its size suggests. It is the
+ * ONLY copy of an emitter that runs on the device, and its host twin is what
+ * the CPU engine runs; the two drifting would show up as the same scene
+ * looking different on the two engines, which is exactly the comparison the
+ * whole ladder exists to make.
  *
  * The dispatch ORDER matches stepGpu.ts — divergence first, then the
  * projection in place, then the outflow clamp — so the test also pins the one
@@ -17,6 +23,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { applyOutflow } from '../core/boundaries.ts';
 import { computeDivergence } from '../core/divergence.ts';
+import { applyDyePatch, makeDyePatch } from '../core/dye.ts';
 import { Cell, createGrid, idxP } from '../core/grid.ts';
 import { subtractGradient } from '../core/subtractGradient.ts';
 import { evalInBrowser, NoBrowserError } from './chromeHarness.ts';
@@ -31,6 +38,9 @@ const GRAD_SCALE = 0.5;
  *  visible rather than coincidentally right. */
 const DYE_KEEP = 0.9137;
 const DYE_CHANNELS = 3;
+/** The inlet: three columns, with a band of zero coverage so the lerp's
+ *  "leave this cell alone" path is exercised rather than assumed. */
+const PATCH_COLS = 3;
 
 /** Deterministic pseudo-random fields. Deliberately NOT given the solid-face
  *  invariant: every kernel under test must get its answers from its own bounds
@@ -68,6 +78,8 @@ function fixture(): {
   return { label, u, v, p, dye };
 }
 
+const list = (a: Float32Array): number[] => Array.from(a);
+
 interface PageResult {
   skip?: string;
   b?: number[];
@@ -88,9 +100,18 @@ function maxDiff(expected: Float64Array, actual: number[] = [], name = ''): numb
   return diff;
 }
 
-test('project.wgsl reproduces divergence, projection, outflow and decay', async (t) => {
+test('project.wgsl reproduces divergence, projection, outflow and the dye kernels', async (t) => {
   const { label, u, v, p, dye } = fixture();
   const g = createGrid(NX, NY, 1 / NY);
+  // Values that vary in BOTH directions, so a transposed patch index shows up,
+  // and a stripe of zero coverage down the middle of the column band.
+  const patch = makeDyePatch(0, 0, PATCH_COLS, NY, (i, j, rgb) => {
+    if (j % 5 === 0) return 0;
+    rgb[0] = 0.1 * i + 0.01 * j;
+    rgb[1] = 1 - 0.02 * j;
+    rgb[2] = 0.5;
+    return j % 7 === 0 ? 0.4 : 1;
+  });
 
   const script = `(async () => {
   if (!navigator.gpu) return { skip: 'navigator.gpu missing (secure context? headless flags?)' };
@@ -119,20 +140,33 @@ test('project.wgsl reproduces divergence, projection, outflow and decay', async 
   const svPipe = pipe('subtract_v');
   const outPipe = pipe('outflow');
   const decayPipe = pipe('decay');
+  const patchPipe = pipe('dye_patch');
 
   const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
   const buf = (len) => device.createBuffer({ size: len * 4, usage: S });
   const uBuf = buf(uLen), vBuf = buf(vLen), pBuf = buf(cells), bBuf = buf(cells);
   const labelBuf = buf(cells);
   const dyeBuf = buf(${DYE_CHANNELS} * cells);
-  // 32, matching PARAMS_BYTES in stepGpu.ts: the struct is 5 words = 20 bytes,
-  // which is the minBindingSize the layout asks for, rounded up.
-  const paramsBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const pd = new ArrayBuffer(32);
+  // 16 and 32, matching PARAMS_BYTES and DYE_PARAMS_BYTES in stepGpu.ts.
+  const U = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+  const paramsBuf = device.createBuffer({ size: 16, usage: U });
+  const pd = new ArrayBuffer(16);
   new Uint32Array(pd).set([nx, ny]);
-  // divCoef = -scale / h, gradScale, dyeKeep — the same fold stepGpu.ts writes.
-  new Float32Array(pd).set([-${SCALE} * ny, ${GRAD_SCALE}, ${DYE_KEEP}], 2);
+  // divCoef = -scale / h, gradScale — the same fold stepGpu.ts writes.
+  new Float32Array(pd).set([-${SCALE} * ny, ${GRAD_SCALE}], 2);
   device.queue.writeBuffer(paramsBuf, 0, pd);
+
+  // DyeParams. The dye grid IS the velocity grid here: this file pins the
+  // kernels' arithmetic, and advect.gputest.ts is where the two grids come
+  // apart.
+  const dyeParamsBuf = device.createBuffer({ size: 32, usage: U });
+  const dpd = new ArrayBuffer(32);
+  new Uint32Array(dpd).set([nx, ny, 0, 0, 0, ${PATCH_COLS}, ny]);
+  new Float32Array(dpd).set([${DYE_KEEP}], 2);
+  device.queue.writeBuffer(dyeParamsBuf, 0, dpd);
+
+  const patchBuf = buf(${DYE_CHANNELS + 1} * ${PATCH_COLS} * ny);
+  device.queue.writeBuffer(patchBuf, 0, new Float32Array(${JSON.stringify(list(patch.data))}));
   device.queue.writeBuffer(uBuf, 0, new Float32Array(uIn));
   device.queue.writeBuffer(vBuf, 0, new Float32Array(vIn));
   device.queue.writeBuffer(pBuf, 0, new Float32Array(pIn));
@@ -147,7 +181,8 @@ test('project.wgsl reproduces divergence, projection, outflow and decay', async 
   const suG = group(suPipe, [[0, paramsBuf], [1, labelBuf], [2, pBuf], [3, uBuf]]);
   const svG = group(svPipe, [[0, paramsBuf], [1, labelBuf], [2, pBuf], [4, vBuf]]);
   const outG = group(outPipe, [[0, paramsBuf], [1, labelBuf], [3, uBuf], [4, vBuf]]);
-  const decayG = group(decayPipe, [[0, paramsBuf], [6, dyeBuf]]);
+  const decayG = group(decayPipe, [[6, dyeBuf], [7, dyeParamsBuf]]);
+  const patchG = group(patchPipe, [[6, dyeBuf], [7, dyeParamsBuf], [8, patchBuf]]);
 
   const enc = device.createCommandEncoder();
   const pass = enc.beginComputePass();
@@ -156,7 +191,9 @@ test('project.wgsl reproduces divergence, projection, outflow and decay', async 
   pass.setPipeline(suPipe); pass.setBindGroup(0, suG); pass.dispatchWorkgroups(Math.ceil((nx + 1) / 8), gy);
   pass.setPipeline(svPipe); pass.setBindGroup(0, svG); pass.dispatchWorkgroups(gx, Math.ceil((ny + 1) / 8));
   pass.setPipeline(outPipe); pass.setBindGroup(0, outG); pass.dispatchWorkgroups(Math.ceil(Math.max(nx, ny) / 64));
+  // Dye, in stepGpu.ts's order: the fade, then the inlet last.
   pass.setPipeline(decayPipe); pass.setBindGroup(0, decayG); pass.dispatchWorkgroups(gx, Math.ceil(ny * ${DYE_CHANNELS} / 8));
+  pass.setPipeline(patchPipe); pass.setBindGroup(0, patchG); pass.dispatchWorkgroups(Math.ceil(${PATCH_COLS} / 8), Math.ceil(ny / 8));
   pass.end();
   const dyeLen = ${DYE_CHANNELS} * cells;
   const readBuf = device.createBuffer({
@@ -199,11 +236,16 @@ test('project.wgsl reproduces divergence, projection, outflow and decay', async 
   const bExp = Float64Array.from(div, (d) => -SCALE * d);
   subtractGradient(g, p, u, v, label, GRAD_SCALE);
   applyOutflow(g, u, v, label);
-  // Simulation.step's fade, over every channel and every cell — the loop
-  // decay() exists to replace. A cell the 2D dispatch missed comes back
-  // unscaled and a cell it hit twice comes back squared; both are ~1e-2 off,
-  // four orders above the f32 floor below.
+  // The dye half, in the same order the pass recorded it. A cell the 2D decay
+  // dispatch missed comes back unscaled and a cell it hit twice comes back
+  // squared; both are ~1e-2 off, four orders above the f32 floor below.
   const dyeExp = Float64Array.from(dye, (q) => q * DYE_KEEP);
+  const cells = NX * NY;
+  const planes = Array.from(
+    { length: DYE_CHANNELS },
+    (_, c) => new Float64Array(dyeExp.buffer, c * cells * 8, cells),
+  );
+  applyDyePatch(g, planes, patch);
 
   const bDiff = maxDiff(bExp, res.b, 'b');
   const uDiff = maxDiff(u, res.u, 'u');
