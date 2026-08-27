@@ -75,10 +75,16 @@ export class FieldView {
   private readonly dyeHeatmap: Heatmap;
   private readonly speed: Float64Array;
   private readonly vort: Float64Array;
-  /** Cached solid-cell mask — see drawSolids. */
-  private solidsPath: Path2D | null = null;
+  /**
+   * Cached solid-cell mask — see drawSolids. The LAYER and not just the path:
+   * the rim is a blur, and a blur is far too expensive to redo per frame.
+   */
+  private solidsLayer: HTMLCanvasElement | null = null;
   private solidsW = 0;
   private solidsH = 0;
+  /** No solids at all — then there is nothing to composite, and skipping beats
+   *  blitting a transparent full-screen layer every frame. */
+  private noSolids = false;
 
   constructor(g: Grid, dg: Grid = g) {
     this.heatmap = new Heatmap(g.nx, g.ny);
@@ -90,7 +96,7 @@ export class FieldView {
   /** The labels changed (a restart, a scene switch); the cached solid mask no
    *  longer matches and the next draw rebuilds it. */
   invalidateSolids(): void {
-    this.solidsPath = null;
+    this.solidsLayer = null;
   }
 
   /**
@@ -233,49 +239,73 @@ export class FieldView {
     const w = ctx.canvas.width;
     const h = ctx.canvas.height;
 
-    // The union is CACHED as a Path2D: labels change only on restart() (which
-    // calls invalidateSolids) and the geometry only on resize (caught by the
-    // size check), yet the scan is over every cell — 2M label reads a frame at
-    // 1920x1080 to rediscover the same cylinder.
-    if (!this.solidsPath || w !== this.solidsW || h !== this.solidsH) {
+    // The whole mask is RENDERED once and blitted after, not just its path.
+    //
+    // The path alone used to be cached — labels change only on a restart or a
+    // brush stroke, yet the scan is over every cell — and that was the right
+    // fix for the scan and the wrong one for the cost that actually mattered.
+    // The rim is a canvas shadow, i.e. a gaussian blur over the path's
+    // bounding box, and it was being computed TWICE per frame. Draw a wall
+    // across the wall-jet scene, which starts with no solids at all, and the
+    // per-frame cost goes from nothing to blurring most of the viewport twice:
+    // measured as a 3x frame-time hit, 60 fps to 20. Compositing a prepared
+    // layer instead is one drawImage, which is a blit the GPU does for free.
+    if (!this.solidsLayer || w !== this.solidsW || h !== this.solidsH) {
       this.solidsW = w;
       this.solidsH = h;
-      this.solidsPath = new Path2D();
+      // ONE path filled ONCE, not a fillRect per cell. Cell edges land on
+      // fractional pixels, and two separate fills sharing such a pixel
+      // composite to 1-(1-a)(1-b) < 1, letting the background bleed through as
+      // a thin seam — a visible grid of stripes across the body. Filling the
+      // union computes that pixel's coverage a single time, so interior edges
+      // disappear.
+      const path = new Path2D();
       const cw = w / g.nx;
       const ch = h / g.ny;
-      for (let j = 0; j < g.ny; j++) {
+      this.noSolids = true;
+      for (let j2 = 0; j2 < g.ny; j2++) {
         // Same y flip as Heatmap.draw and gridToScreen.
-        const y = h - (j + 1) * ch;
-        for (let i = 0; i < g.nx; i++) {
-          if (label[idxP(g, i, j)] === Cell.Solid) this.solidsPath.rect(i * cw, y, cw, ch);
+        const y = h - (j2 + 1) * ch;
+        for (let i2 = 0; i2 < g.nx; i2++) {
+          if (label[idxP(g, i2, j2)] !== Cell.Solid) continue;
+          path.rect(i2 * cw, y, cw, ch);
+          this.noSolids = false;
         }
       }
+
+      // A DARK body with a lit rim, and the rim is what makes the dark
+      // possible. This was a pale grey fill, on the argument that black reads
+      // as a hole. True, but the fill was competing: the dye view's background
+      // IS black, so a near-white slab was the brightest object in the frame
+      // and it sat in the middle of it, pulling the eye off the smoke it
+      // exists to interrupt. The rim keeps the silhouette legible on both dark
+      // views — the dye view and iceFire's dark-at-zero vorticity map — while
+      // the body itself recedes to roughly the background.
+      //
+      // Drawn as a SHADOW and not a stroke, and that is forced rather than
+      // stylistic: the path is a union of one rect per solid cell, so stroking
+      // it would outline every interior cell edge as well as the silhouette
+      // and the body would come back as a bright grid. A shadow is cast from
+      // the composited alpha of the whole path, which has no interior edges in
+      // it. Two passes because a single one is barely visible at this radius,
+      // and the fill is opaque so the glow only ever shows outside.
+      // The layer is allocated only once there is something to put in it. A
+      // full-viewport canvas is ~30 MB at 4K, and half the scenes have no
+      // geometry at all until the brush gives them some.
+      if (this.noSolids) return;
+      this.solidsLayer = document.createElement('canvas');
+      this.solidsLayer.width = w;
+      this.solidsLayer.height = h;
+      const lc = this.solidsLayer.getContext('2d')!;
+
+      const dpr = w / (ctx.canvas.clientWidth || w);
+      lc.shadowColor = 'rgba(150, 200, 255, 0.75)';
+      lc.shadowBlur = 9 * dpr;
+      lc.fillStyle = '#161c26';
+      lc.fill(path);
+      lc.fill(path);
     }
-    // A DARK body with a lit rim, and the rim is what makes the dark possible.
-    //
-    // This used to be a pale grey fill, on the argument that black reads as a
-    // hole. True, but the fill was competing: the dye view's background IS
-    // black, so a near-white slab was the brightest object in the frame and it
-    // sat in the middle of it, pulling the eye off the smoke it exists to
-    // interrupt. The rim keeps the silhouette legible on both dark views — the
-    // dye view and iceFire's dark-at-zero vorticity map — while the body
-    // itself recedes to roughly the background, so the picture is the flow.
-    //
-    // Drawn as a SHADOW and not a stroke, and that is forced rather than
-    // stylistic. solidsPath is a union of one rect per solid cell, so stroking
-    // it would outline every interior cell edge as well as the outline, and
-    // the body would come back as a bright grid. A shadow is cast from the
-    // composited alpha of the whole path, which has no interior edges in it —
-    // the same reason the path is filled once rather than per cell, one step
-    // further on. Two passes because a single one is barely visible at this
-    // radius, and the fill is opaque so the glow only ever shows outside.
-    const dpr = ctx.canvas.width / (ctx.canvas.clientWidth || ctx.canvas.width);
-    ctx.save();
-    ctx.shadowColor = 'rgba(150, 200, 255, 0.75)';
-    ctx.shadowBlur = 9 * dpr;
-    ctx.fillStyle = '#161c26';
-    ctx.fill(this.solidsPath);
-    ctx.fill(this.solidsPath);
-    ctx.restore();
+
+    if (this.solidsLayer) ctx.drawImage(this.solidsLayer, 0, 0);
   }
 }

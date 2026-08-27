@@ -54,6 +54,23 @@ export interface Scene {
   label: string;
   /** One sentence, for someone who has never heard of a vortex street. */
   blurb: string;
+  /**
+   * One experiment to try with the brush, named by its OUTCOME rather than by
+   * the gesture — ui/controls.ts's GESTURE constant already says shift-drag
+   * draws and a plain drag stirs, once, ahead of every scene's hint, so this
+   * only has to say what to try and what should happen.
+   *
+   * The outcome matters because a blank invitation to draw is not a question:
+   * left to themselves people scribble for five seconds and stop. Told that a
+   * bar behind the cylinder will WEAKEN the shedding, they are running an
+   * experiment with a prediction to check, and the flow answers.
+   *
+   * The two — the stroke and its outcome — had better match, and that is worth
+   * restating even with the gesture said elsewhere: a hint whose outcome does
+   * not happen is worse than no hint, since the viewer concludes the brush is
+   * broken rather than that they aimed badly.
+   */
+  hint?: string;
   /** Geometry and velocity. Never dye — see the file comment. */
   build: (g: Grid) => SceneSpec;
   /** First entry is what the scene opens with. */
@@ -193,6 +210,7 @@ export const SCENES: Scene[] = [
     id: 'grid',
     label: 'Turbulence grid',
     blurb: 'A row of rods trips the stream; the small wakes merge into ever larger eddies.',
+    hint: 'Try a wall with a gap in it — the churn funnels into a jet.',
     build: (g) => turbulenceGridChannel(g),
     /**
      * The HUE RAMP leads here, and it is the one scene where it beats the two
@@ -214,9 +232,21 @@ export const SCENES: Scene[] = [
     dyes: [stripesIn, twoToneIn(() => 0.5), smokeIn, none],
   },
   {
+    id: 'jet',
+    label: 'Wall jet',
+    blurb: 'A nozzle in the left wall; the confined jet entrains and recirculates.',
+    hint: 'The emptiest scene — good one to build in.',
+    // openRight() is not optional: wallJet is pure inflow, so without an outlet
+    // the all-Neumann system is inconsistent and never converges.
+    build: () => ({ labels: openRight(), seed: jet.seed }),
+    dyes: [{ id: 'smoke', label: 'Smoke', source: () => jet.source }, none],
+    decay: 0.5,
+  },
+  {
     id: 'karman',
     label: 'Vortex street',
     blurb: 'Flow past a cylinder, shedding vortices left and right in turn.',
+    hint: 'Try a long bar back along the wake — the street weakens and stretches.',
     build: (g) => karmanChannel(g),
     // Two tints lead on the bodies: there are exactly two populations of fluid
     // and the wake sheds alternately from each, so the colours arrive one per
@@ -227,6 +257,7 @@ export const SCENES: Scene[] = [
     id: 'airfoil',
     label: 'Wing section',
     blurb: 'A cambered wing past its stalling angle; the flow lets go of the upper surface.',
+    hint: 'Try a flap on the trailing edge, or a wall in front of the nose.',
     build: (g) => airfoilChannel(g),
     dyes: [twoToneIn(() => leadingEdgeY()), stripesIn, smokeIn, none],
   },
@@ -234,6 +265,7 @@ export const SCENES: Scene[] = [
     id: 'cluster',
     label: 'Vortex cluster',
     blurb: 'Vortices orbit, stretch each other into filaments, and merge.',
+    hint: 'Try a wall through the middle and watch the vortices work around it.',
     // Vortex COUNT scales with the box, blob size does not. The blobs are
     // sized against the height (sigma is in world units and the domain is one
     // unit tall), so on a wide screen a fixed 14 of them leaves most of the
@@ -248,18 +280,9 @@ export const SCENES: Scene[] = [
     id: 'dipole',
     label: 'Dipole',
     blurb: 'A counter-rotating pair, each vortex carried by the other one’s flow.',
+    hint: "Try a wall in the pair's path — it splits and rebounds.",
     build: () => ({ seed: addVortexPair }),
     dyes: [stripes, triad, blob, none],
-  },
-  {
-    id: 'jet',
-    label: 'Wall jet',
-    blurb: 'A nozzle in the left wall; the confined jet entrains and recirculates.',
-    // openRight() is not optional: wallJet is pure inflow, so without an outlet
-    // the all-Neumann system is inconsistent and never converges.
-    build: () => ({ labels: openRight(), seed: jet.seed }),
-    dyes: [{ id: 'smoke', label: 'Smoke', source: () => jet.source }, none],
-    decay: 0.5,
   },
 ];
 

@@ -8,7 +8,7 @@
  * after all of them, so a shape here stays a shape.
  */
 
-import { Cell, idxP } from '../core/grid.ts';
+import { Cell, idxP, type Grid } from '../core/grid.ts';
 import type { LabelSeed } from '../core/simulation.ts';
 
 /** Applies several label seeds in order; later ones win where they overlap. */
@@ -57,6 +57,68 @@ export function solidRect(x0: number, y0: number, x1: number, y1: number): Label
       }
     }
   };
+}
+
+/**
+ * Paints a SOLID capsule — a segment of radius r — into an existing label
+ * field, immediately, rather than returning a seed to be applied at reset.
+ * The interactive brush. Returns whether anything actually changed, so the
+ * caller can skip the label upload and the solids-mask rebuild on a stroke
+ * that landed entirely on cells that were already solid.
+ *
+ * A CAPSULE and not a disk because a pointer is sampled once per frame and
+ * moves a long way between samples. Stamping a disk per sample leaves a dotted
+ * line at any speed a person actually drags at; sweeping the disk along the
+ * segment since the last sample is the same cost and draws a continuous
+ * stroke.
+ *
+ * ONLY Fluid becomes Solid, which is a safety rule and not an optimisation.
+ * The outlet is a column of Air cells, and painting over it would turn a
+ * channel back into a closed box — an all-Neumann system with a large net
+ * inflow, which has no solution at all and which the solver would express as a
+ * pressure field diverging without bound. Restricting the brush to Fluid also
+ * makes a second stroke over the same place a no-op rather than a rewrite.
+ */
+export function paintSolid(
+  g: Grid,
+  label: Uint8Array,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  r: number,
+): boolean {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const lenSq = dx * dx + dy * dy;
+  const r2 = r * r;
+  let changed = false;
+
+  // Only the cells the capsule's bounding box can reach.
+  const lo = (w: number): number => Math.max(0, Math.floor(w / g.h - 0.5));
+  const i0 = lo(Math.min(x0, x1) - r);
+  const i1 = Math.min(g.nx - 1, Math.ceil((Math.max(x0, x1) + r) / g.h - 0.5));
+  const j0 = lo(Math.min(y0, y1) - r);
+  const j1 = Math.min(g.ny - 1, Math.ceil((Math.max(y0, y1) + r) / g.h - 0.5));
+
+  for (let j = j0; j <= j1; j++) {
+    const y = (j + 0.5) * g.h;
+    for (let i = i0; i <= i1; i++) {
+      const k = idxP(g, i, j);
+      if (label[k] !== Cell.Fluid) continue;
+      const x = (i + 0.5) * g.h;
+      // Distance to the SEGMENT: project onto it, clamp to its ends. lenSq 0
+      // is a single click, where t collapses to 0 and this is a plain disk.
+      const t = lenSq > 0 ? Math.min(Math.max(((x - x0) * dx + (y - y0) * dy) / lenSq, 0), 1) : 0;
+      const px = x0 + t * dx - x;
+      const py = y0 + t * dy - y;
+      if (px * px + py * py <= r2) {
+        label[k] = Cell.Solid;
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 /**

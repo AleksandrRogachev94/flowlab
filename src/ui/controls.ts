@@ -46,6 +46,10 @@ export interface SceneOption extends Option {
   /** One sentence under the scene bar, for a viewer who has never heard of a
    *  vortex street. */
   blurb: string;
+  /** The brush experiment worth trying here — see Scene.hint. Rendered
+   *  dimmer and on its own line, because it is an invitation rather than a
+   *  description and should not be mistaken for part of the blurb. */
+  hint?: string;
 }
 
 /** The lists every control is built from. main.ts supplies them because it is
@@ -59,6 +63,16 @@ export interface ControlsSpec {
   schemes: Option[];
   qualities: Option[];
 }
+
+/**
+ * The two brush gestures, stated once rather than folded into every scene's
+ * hint. Every scene supports both — stirring and drawing are properties of
+ * the brush, not of the scene — so repeating "drag to stir, shift-drag to
+ * draw" six times would be six copies of the same sentence with a different
+ * scene name stapled on. This is the line that TEACHES the gesture; the
+ * per-scene hint below it only ever suggests what to try once you have it.
+ */
+const GESTURE = 'Drag to stir the flow. Shift-drag to draw walls into it.';
 
 type Setter = (key: UiKey, value: string | boolean) => void;
 
@@ -174,6 +188,14 @@ export class Controls {
     }
     const scene = this.scenes.find((s) => s.value === this.state.scene);
     this.blurb.textContent = scene?.blurb ?? '';
+    // Two separate elements, not one string: GESTURE teaches the brush and
+    // the scene's own hint suggests an experiment with it, and those are
+    // different enough claims that running them into one line blurred both —
+    // a long gesture-plus-experiment sentence read as description again,
+    // exactly what .hint's rule exists to avoid. Splitting them one per line
+    // keeps each readable as its own short instruction.
+    this.blurb.append(el('span', 'hint', GESTURE));
+    if (scene?.hint) this.blurb.append(el('span', 'hint-scene', scene.hint));
   }
 
   /** The scene changed, so the meaningful tracers did too. */

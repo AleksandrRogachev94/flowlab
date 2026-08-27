@@ -13,6 +13,7 @@ import { GpuMultigridSolver } from './gpu/multigridGpu.ts';
 import { GpuPressureSolver } from './gpu/pressureGpu.ts';
 import { GpuStepper } from './gpu/stepGpu.ts';
 import { dyeOf, SCENES, sceneSpec, type Scene } from './scenes/catalog.ts';
+import { paintSolid } from './scenes/obstacles.ts';
 import {
   Controls,
   type Engine,
@@ -145,7 +146,12 @@ const VIEW_LABELS: Record<View, string> = {
 /** Built once and shared by the dropdown and the shortcut that cycles it, so
  *  the two cannot disagree about the order or the contents. */
 const VIEW_OPTIONS: Option[] = VIEWS.map((v) => ({ value: v, label: VIEW_LABELS[v] }));
-const SCENE_OPTIONS = SCENES.map((s) => ({ value: s.id, label: s.label, blurb: s.blurb }));
+const SCENE_OPTIONS = SCENES.map((s) => ({
+  value: s.id,
+  label: s.label,
+  blurb: s.blurb,
+  hint: s.hint,
+}));
 
 const SCHEMES: Option[] = [
   { value: 'macCormack', label: 'MacCormack (sharp)' },
@@ -584,6 +590,168 @@ window.addEventListener('keydown', (e) => {
   KEYS[e.key.toLowerCase()]?.();
 });
 
+/* -------------------------------------------------------------------- brush */
+
+/**
+ * Obstacle radius, in WORLD units — the channel is 1 tall, so this is a
+ * fraction of its height and the same physical brush at every resolution.
+ *
+ * THIN, deliberately, and thin is the hard direction to recover. A wide shape
+ * is a few strokes away; nothing gets back a brush too coarse to draw a plate
+ * with, and the plate is the stroke worth having — the bar that kills the
+ * vortex street works by separating the two shear layers, so a fat one is just
+ * a second bluff body making a wake of its own. At 0.008 the stroke is 0.016
+ * across, roughly a tenth of the cylinder's diameter, which is a plate rather
+ * than a body.
+ *
+ * Floored at 1.5 cells so it still rasterizes as a continuous barrier on the
+ * low preset: solidRect and paintSolid both test cell CENTRES, and a stroke
+ * thinner than a cell paints an intermittent line the flow leaks straight
+ * through — which reads as a broken brush, not as a fine one.
+ */
+const BRUSH_R = 0.008;
+
+/**
+ * The stir brush: radius in world units, and the gain turning pointer
+ * displacement into a velocity increment.
+ *
+ * HALF OF ANY PUSH IS PROJECTED AWAY, and the gain has to be set knowing that.
+ * The bump is divergent by construction and the pressure solve keeps only the
+ * part the fluid can actually make; measured on a still box at 192x108, the
+ * surviving kinetic energy and peak speed are:
+ *
+ *     radius   0.03    0.06    0.10    0.16
+ *     kept      50%     49%     47%     42%      of the injected energy
+ *
+ * with the peak speed after projection landing at 0.48 of the increment asked
+ * for, flat in amplitude (the system is linear, so efficiency cannot depend on
+ * how hard you push).
+ *
+ * The flatness is the useful part, and it is the opposite of what is easy to
+ * assume: a wide push is not more efficient than a narrow one — if anything it
+ * is slightly worse. A wider brush is still the right choice, but for a plain
+ * reason rather than a subtle one, which is that energy goes as the AREA. At
+ * the same amplitude r = 0.1 delivers nearly three times what r = 0.06 does.
+ * Past about 0.1 it stops reading as a stir and starts reading as a wind.
+ *
+ * The gain then follows from one anchor: dragging a tenth of the channel
+ * height in a frame should leave the fluid moving at roughly the free-stream
+ * speed, so a brisk drag competes with the flow and a slow one nudges it.
+ * That wants 0.1 * gain * 0.48 ~= 1.2, hence 26. The first version used 12,
+ * which was that same anchor with the projection loss forgotten — it asked for
+ * 1.2 and delivered 0.58, and felt weak for exactly that reason.
+ */
+const STIR_R = 0.075;
+const STIR_GAIN = 26;
+
+/** The last pointer position, in world units — the other end of the capsule a
+ *  paint stroke sweeps, and the displacement a stir pushes along. Null when no
+ *  stroke is in progress. */
+let strokeFrom: { x: number; y: number } | null = null;
+/** A stroke landed on new cells; the frame loop owes the engines a commit. */
+let pendingLabels = false;
+
+/**
+ * Pointer position in WORLD units: x in [0, nx*h], y in [0, 1] with y UP.
+ *
+ * Off the canvas RECT rather than the backing store, which are different
+ * numbers on a retina display and different again from the grid — the canvas
+ * is oversampled (see sizeCanvas) and the grid is a third resolution. A
+ * fraction of the rect is the one quantity all three agree on.
+ */
+function worldAt(e: PointerEvent): { x: number; y: number } {
+  const rect = canvas.getBoundingClientRect();
+  const fx = (e.clientX - rect.left) / rect.width;
+  // Row 0 is the BOTTOM of the domain and the TOP of the screen — the same
+  // flip Heatmap.draw and the dye shader make.
+  const fy = 1 - (e.clientY - rect.top) / rect.height;
+  const g = app.sim.g;
+  return { x: fx * g.nx * g.h, y: fy };
+}
+
+/**
+ * Paints one segment of a stroke.
+ *
+ * The label edit lands on the host array immediately, but the COMMIT is
+ * deferred to the top of the next frame, and that is the same correctness
+ * argument as pendingRebuild's rather than tidiness: a GPU step spends most of
+ * its life awaiting a readback, and uploading labels to a device mid-submit
+ * races the very kernels reading them. Editing f.label is safe at any moment —
+ * nothing on the device reads the host array — so only the commit has to wait.
+ */
+function paintAt(e: PointerEvent): void {
+  const to = worldAt(e);
+  const from = strokeFrom ?? to;
+  strokeFrom = to;
+  const r = Math.max(BRUSH_R, 1.5 * app.sim.g.h);
+  if (paintSolid(app.sim.g, app.sim.f.label, from.x, from.y, to.x, to.y, r)) {
+    pendingLabels = true;
+  }
+}
+
+/**
+ * Pushes the fluid along the pointer's displacement since the last sample.
+ *
+ * The DISPLACEMENT is the input, not a speed and not a force — core/stir.ts
+ * carries the argument, but the short version is that it is what makes the
+ * gesture frame-rate independent for free: halve the frame rate and each
+ * frame's delta doubles, so a stroke of a given length delivers the same total
+ * push either way.
+ *
+ * A stationary press therefore does nothing at all, which is correct. Nothing
+ * about holding a mouse still says "keep pushing".
+ */
+function stirAt(e: PointerEvent): void {
+  const to = worldAt(e);
+  const from = strokeFrom;
+  strokeFrom = to;
+  if (!from) return; // The first sample of a stroke has no displacement yet.
+  app.sim.stir = {
+    x: to.x,
+    y: to.y,
+    r: STIR_R,
+    dx: (to.x - from.x) * STIR_GAIN,
+    dy: (to.y - from.y) * STIR_GAIN,
+  };
+}
+
+// Drag stirs, shift-drag draws. The modifier is read per EVENT rather than
+// latched at pointerdown, so Shift can be picked up or dropped mid-stroke and
+// the gesture changes under the still-held button — which is how a drawing
+// tool behaves and, more practically, means a stroke started wrong does not
+// have to be released and begun again.
+//
+// pointerdown on the CANVAS and not the window, so a drag that starts on a
+// control belongs to the control.
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  // Capture, or a fast drag that leaves the canvas silently stops and resumes
+  // somewhere else, drawing a line across everything it skipped.
+  canvas.setPointerCapture(e.pointerId);
+  strokeFrom = null;
+  if (e.shiftKey) paintAt(e);
+  else stirAt(e);
+});
+canvas.addEventListener('pointermove', (e) => {
+  // buttons, not button: on a move event `button` is meaningless.
+  if (e.buttons === 0) return;
+  if (e.shiftKey) paintAt(e);
+  else stirAt(e);
+});
+const endStroke = (): void => {
+  strokeFrom = null;
+};
+canvas.addEventListener('pointerup', endStroke);
+canvas.addEventListener('pointercancel', endStroke);
+
+// The cursor is the only affordance there is: nothing on screen says the flow
+// can be drawn into, so holding Shift has to answer that by itself.
+const setCursor = (e: KeyboardEvent): void => {
+  canvas.style.cursor = e.shiftKey ? 'crosshair' : '';
+};
+window.addEventListener('keydown', setCursor);
+window.addEventListener('keyup', setCursor);
+
 /**
  * The grid is derived from the window, so a resize changes the simulation and
  * not just the picture — hence a rebuild rather than a re-fit, and hence the
@@ -697,6 +865,13 @@ async function frame(): Promise<void> {
   if (pendingEngine) {
     pendingEngine = false;
     await applyEngineDeferred();
+  }
+  // After the rebuild/restart above, which both reseed labels wholesale and
+  // would strand a commit for cells that no longer exist.
+  if (pendingLabels) {
+    pendingLabels = false;
+    app.sim.commitLabelEdits();
+    app.view.invalidateSolids();
   }
 
   if (ready) {

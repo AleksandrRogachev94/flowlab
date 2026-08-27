@@ -43,6 +43,20 @@ struct DyeParams {
   pad: u32,
 };
 
+/** core/stir.ts's brush, in WORLD units. `h` rides along because Params has no
+ *  cell size in it and the brush is the only kernel here that needs one. */
+struct StirParams {
+  cx: f32,
+  cy: f32,
+  /** 1 / r^2, so the kernel divides nothing. */
+  invR2: f32,
+  dx: f32,
+  dy: f32,
+  h: f32,
+  pad0: f32,
+  pad1: f32,
+};
+
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> label: array<u32>;
 @group(0) @binding(2) var<storage, read> p: array<f32>;
@@ -62,6 +76,7 @@ struct DyeParams {
 // DyePatch, laid out exactly as it is on the host. Named `inlet` and not
 // `patch` because WGSL reserves that word.
 @group(0) @binding(8) var<storage, read> inlet: array<f32>;
+@group(0) @binding(9) var<uniform> stirParams: StirParams;
 
 const AIR: u32 = 1u;
 const SOLID: u32 = 2u;
@@ -79,6 +94,89 @@ fn solidOrOutside(i: i32, j: i32) -> bool {
     return true;
   }
   return label[idxP(u32(i), u32(j))] == SOLID;
+}
+
+// commitLabels' face rule, on the device — see core/boundaries.ts.
+//
+// It exists for ONE caller: the interactive brush, which paints Solid cells
+// into `label` while the fields are resident here. Every other kernel below
+// rests on the invariant that a face bordering a solid already stores the
+// solid's velocity — divergence() says so explicitly and reads faces without
+// consulting labels at all, and subtract_*() leaves such a face alone on the
+// grounds that it IS the u.n = 0 wall condition. Both are true as long as
+// labels only ever change at reset, when the host's commitLabels runs. Paint a
+// solid into moving fluid and they stop being true: those faces keep whatever
+// the flow had, and the fluid cell next door reads that as flux through a
+// wall. This restores it.
+//
+// The solid test here is IN-DOMAIN ONLY, unlike solidOrOutside above, and the
+// difference is load-bearing rather than pedantic. Treating off-grid as solid
+// would zero u[0, j] — the prescribed inlet — on the first stroke, and every
+// channel scene would quietly lose its free stream.
+fn solidCell(i: i32, j: i32) -> bool {
+  if (i < 0 || j < 0 || i >= i32(params.nx) || j >= i32(params.ny)) {
+    return false;
+  }
+  return label[idxP(u32(i), u32(j))] == SOLID;
+}
+
+// One dispatch covering both face grids: (nx+1) x (ny+1) threads, each doing
+// the u face and the v face it owns where those exist. p needs no pass — the
+// smoother skips non-fluid cells and subtract_*() reads p only after checking
+// both neighbours are non-solid, so a stale pressure inside a new solid is
+// never read by anything.
+@compute @workgroup_size(8, 8)
+fn commit_labels(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = i32(gid.x);
+  let j = i32(gid.y);
+  if (gid.x <= params.nx && gid.y < params.ny) {
+    if (solidCell(i - 1, j) || solidCell(i, j)) { u[idxU(gid.x, gid.y)] = 0.0; }
+  }
+  if (gid.x < params.nx && gid.y <= params.ny) {
+    if (solidCell(i, j - 1) || solidCell(i, j)) { v[idxV(gid.x, gid.y)] = 0.0; }
+  }
+}
+
+// core/stir.ts's brush — the mouse dragging through the fluid.
+//
+// A direct transcription, including the two bounds rules, and both are
+// load-bearing: interior faces only, so the channel's prescribed inlet at
+// u[0, j] cannot be edited by dragging over it, and nothing touching a solid,
+// so the wall invariant the rest of this file rests on survives a stir. They
+// are subtract_*()'s bounds exactly, for exactly the same reasons.
+//
+// Dispatched only on the frames a drag is actually happening, so the
+// whole-grid sweep costs nothing the rest of the time — which is why it does
+// not bother restricting itself to the brush's bounding box the way the host
+// version does. On the host that loop is 2M iterations of real work; here it
+// is one cheap kernel that the scheduler runs wide.
+@compute @workgroup_size(8, 8)
+fn stir(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  let j = gid.y;
+  let si = i32(i);
+  let sj = i32(j);
+  // u faces sit at (i*h, (j+0.5)*h) and v faces at ((i+0.5)*h, j*h). Sampling
+  // the bump at each face's OWN position, not at its cell centre, is what
+  // keeps the brush round on a staggered grid.
+  if (i >= 1u && i < params.nx && j < params.ny) {
+    if (!solidCell(si - 1, sj) && !solidCell(si, sj)) {
+      let d = vec2<f32>(
+        f32(i) * stirParams.h - stirParams.cx,
+        (f32(j) + 0.5) * stirParams.h - stirParams.cy,
+      );
+      u[idxU(i, j)] += stirParams.dx * exp(-dot(d, d) * stirParams.invR2);
+    }
+  }
+  if (i < params.nx && j >= 1u && j < params.ny) {
+    if (!solidCell(si, sj - 1) && !solidCell(si, sj)) {
+      let d = vec2<f32>(
+        (f32(i) + 0.5) * stirParams.h - stirParams.cx,
+        f32(j) * stirParams.h - stirParams.cy,
+      );
+      v[idxV(i, j)] += stirParams.dy * exp(-dot(d, d) * stirParams.invR2);
+    }
+  }
 }
 
 // computeDivergence, fused with the rhs fold (see divCoef above). Reads the

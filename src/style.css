@@ -176,16 +176,56 @@ button.ghost:hover {
    vortex street is. */
 .blurb {
   position: absolute;
-  top: 58px;
+  top: 56px;
   left: 18px;
-  right: 300px;
-  max-width: 56ch;
-  color: var(--dim);
-  font-size: 12.5px;
-  /* Both readouts sit directly on the picture, and the picture can be any
-     colour at all. A shadow is what keeps them legible over a bright frame
-     without putting a box around them. */
-  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.9);
+  /* No `right`, so the box shrink-wraps its text instead of reserving a fixed
+     column: a two-word blurb should not draw a panel across half the frame.
+     The cap keeps it clear of the controls panel on a narrow window. */
+  max-width: min(58ch, calc(100vw - 340px));
+  padding: 9px 13px 10px;
+  border-radius: 11px;
+  /* GLASS, not a text shadow. The shadow was the original treatment and it
+     works only against a dark frame — over the wing scene's orange the dim
+     grey went to nearly nothing, which is the one thing this line cannot
+     afford, being the only text on screen aimed at someone who does not
+     already know what they are looking at. A backdrop makes legibility
+     independent of the picture, and it is the same glass the panel and the
+     chips already use, so it adds no new visual language. */
+  background: var(--glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* The brush invitation, on its own line under the blurb and dimmer than it:
+   the blurb describes what you are looking at, the hint asks you to do
+   something, and they should not read as one sentence. The accent tint is the
+   same one the active scene chip uses, which is what marks it as a control
+   rather than prose. */
+.hint {
+  display: block;
+  margin-top: 7px;
+  padding-top: 7px;
+  /* A rule, because the two lines are different KINDS of statement: the blurb
+     describes what is on screen, the hint asks you to do something. Run
+     together they read as one sentence and the invitation is lost. */
+  border-top: 1px solid var(--line);
+  color: var(--accent);
+}
+
+/* The scene's own suggestion, directly under the gesture line and on ITS OWN
+   line too — no rule here, since both .hint and .hint-scene are already the
+   same kind of statement (an instruction) and a second rule between them
+   would read as a third section that is not there. display:block alone is
+   enough separation once the gesture line has already broken away from the
+   blurb above it. */
+.hint-scene {
+  display: block;
+  margin-top: 3px;
+  color: var(--accent);
 }
 
 /* ------------------------------------------------------------------ panel */

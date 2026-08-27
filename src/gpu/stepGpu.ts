@@ -3,6 +3,7 @@ import { PATCH_PLANES, type DyePatch } from '../core/dye.ts';
 import type { FieldArray, Fields, Grid } from '../core/grid.ts';
 import { smooth, type Profiler } from '../core/profiler.ts';
 import type { GpuStep } from '../core/simulation.ts';
+import type { Stir } from '../core/stir.ts';
 import type { GpuAdvector } from './advectGpu.ts';
 import type { GpuContext } from './device.ts';
 import type { GpuMultigridSolver } from './multigridGpu.ts';
@@ -77,6 +78,8 @@ const PARAMS_BYTES = 16;
 
 /** project.wgsl's DyeParams: eight words, all of them named there. */
 const DYE_PARAMS_BYTES = 32;
+/** StirParams: eight floats, five used and three of padding. */
+const STIR_BYTES = 32;
 
 /** Must match CHANNELS in project.wgsl / DYE_CHANNELS in core/grid.ts. */
 const DYE_CHANNELS = 3;
@@ -99,12 +102,17 @@ export class GpuStepper implements GpuStep {
   private readonly dyeParamsU32 = new Uint32Array(this.dyeParamsData);
   private readonly dyeParamsF32 = new Float32Array(this.dyeParamsData);
 
+  private readonly stirPipeline: GPUComputePipeline;
+  private readonly commitPipeline: GPUComputePipeline;
   private readonly divergencePipeline: GPUComputePipeline;
   private readonly subtractUPipeline: GPUComputePipeline;
   private readonly subtractVPipeline: GPUComputePipeline;
   private readonly outflowPipeline: GPUComputePipeline;
   private readonly decayPipeline: GPUComputePipeline;
   private readonly patchPipeline: GPUComputePipeline;
+  private readonly stirGroup: GPUBindGroup;
+  private readonly stirBuf: GPUBuffer;
+  private readonly commitGroup: GPUBindGroup;
   private readonly divergenceGroup: GPUBindGroup;
   private readonly subtractUGroup: GPUBindGroup;
   private readonly subtractVGroup: GPUBindGroup;
@@ -129,6 +137,17 @@ export class GpuStepper implements GpuStep {
   /** True whenever the HOST holds truth the device hasn't seen. Starts true:
    *  the first step is exactly the "host just changed everything" case. */
   private dirty = true;
+  /**
+   * Labels changed under a device that is otherwise up to date — the brush.
+   * Separate from `dirty` because it is a far smaller event: `dirty` means the
+   * host holds truth for EVERY field and re-uploads u, v, p, dye and labels,
+   * which mid-run would also overwrite the resident dye with the host's stale
+   * mirror (see readDye) and undo the picture. This uploads labels alone.
+   */
+  private labelsDirty = false;
+  /** The brush's push for THIS step, or null. Consumed by step() and cleared:
+   *  a drag is one frame's displacement, not a state that persists. */
+  private stir: Stir | null = null;
   private busy = false;
 
   /**
@@ -140,6 +159,8 @@ export class GpuStepper implements GpuStep {
    * timestamps have to follow the velocity or reading them would reintroduce
    * exactly the stall this removes.
    */
+  /** Scratch for the stir uniform — eight floats, written per dragged frame. */
+  private readonly stirHost = new Float32Array(8);
   private velMap: Promise<undefined> | null = null;
   private timeMap: Promise<undefined> | null = null;
 
@@ -168,6 +189,7 @@ export class GpuStepper implements GpuStep {
       size: DYE_PARAMS_BYTES,
       usage: uniform,
     });
+    this.stirBuf = device.createBuffer({ label: 'stir', size: STIR_BYTES, usage: uniform });
 
     const module = device.createShaderModule({ label: 'project', code: projectSource });
     const pipe = (entryPoint: string): GPUComputePipeline =>
@@ -176,6 +198,8 @@ export class GpuStepper implements GpuStep {
         layout: 'auto',
         compute: { module, entryPoint },
       });
+    this.commitPipeline = pipe('commit_labels');
+    this.stirPipeline = pipe('stir');
     this.divergencePipeline = pipe('divergence');
     this.subtractUPipeline = pipe('subtract_u');
     this.subtractVPipeline = pipe('subtract_v');
@@ -188,6 +212,19 @@ export class GpuStepper implements GpuStep {
     // advector's resident velocity, dye and labels, the multigrid's fine x and
     // b — which is the composition in one place.
     const fine = mg.levels[0];
+    this.commitGroup = this.group(this.commitPipeline, [
+      { binding: 0, buffer: this.paramsBuf },
+      { binding: 1, buffer: adv.labelBuf },
+      { binding: 3, buffer: adv.uIn },
+      { binding: 4, buffer: adv.vIn },
+    ]);
+    this.stirGroup = this.group(this.stirPipeline, [
+      { binding: 0, buffer: this.paramsBuf },
+      { binding: 1, buffer: adv.labelBuf },
+      { binding: 3, buffer: adv.uIn },
+      { binding: 4, buffer: adv.vIn },
+      { binding: 9, buffer: this.stirBuf },
+    ]);
     this.divergenceGroup = this.group(this.divergencePipeline, [
       { binding: 0, buffer: this.paramsBuf },
       { binding: 3, buffer: adv.uIn },
@@ -244,6 +281,31 @@ export class GpuStepper implements GpuStep {
    *  a CPU solver). The next step() re-uploads them and re-coarsens labels. */
   invalidate(): void {
     this.dirty = true;
+  }
+
+  /**
+   * New Solid cells, painted by the user while the fields are resident here.
+   *
+   * Labels ONLY: the resident velocity and dye are the truth and must survive,
+   * which is exactly what invalidate() would destroy — it re-uploads every
+   * field from the host, and the host's dye mirror is stale by design while
+   * this path drives (see readDye). So this writes the two label buffers and
+   * flags the two things that follow from a label change: the multigrid's
+   * coarsened label stack has to be rebuilt, and the wall invariant every
+   * kernel here rests on has to be re-established on the faces that just
+   * became solid (project.wgsl's commit_labels).
+   */
+  setStir(stir: Stir | null): void {
+    this.stir = stir;
+  }
+
+  setLabels(label: Uint8Array): void {
+    const { adv, mg } = this;
+    // The advector owns the u32 widening buffer; Uint8Array has no WGSL type.
+    adv.labelHost.set(label);
+    this.device.queue.writeBuffer(adv.labelBuf, 0, adv.labelHost);
+    this.device.queue.writeBuffer(mg.levels[0].label, 0, adv.labelHost);
+    this.labelsDirty = true;
   }
 
   /**
@@ -351,6 +413,15 @@ export class GpuStepper implements GpuStep {
           ? { querySet: this.querySet, beginningOfPassWriteIndex: 0 }
           : undefined,
       });
+      // BEFORE the advection, and inside pass1 rather than in a pass of its
+      // own: WebGPU orders dispatches within a compute pass and inserts the
+      // storage barriers between them, which is the same guarantee pass2's
+      // divergence -> solve -> subtract chain already relies on. Advection
+      // would otherwise spend one step backtracing against faces that still
+      // hold the flow that was there before the obstacle appeared.
+      if (this.labelsDirty) {
+        this.dispatch(pass1, this.commitPipeline, this.commitGroup, this.nx + 1, this.ny + 1);
+      }
       adv.recordVelocity(pass1, mac);
       pass1.end();
       // The resident-field trick (class comment): fold the advected result
@@ -358,14 +429,30 @@ export class GpuStepper implements GpuStep {
       encoder.copyBufferToBuffer(mac ? adv.uB : adv.uA, 0, adv.uIn, 0, adv.uBytes);
       encoder.copyBufferToBuffer(mac ? adv.vB : adv.vA, 0, adv.vIn, 0, adv.vBytes);
 
+      if (this.stir) {
+        const { x, y, r, dx, dy } = this.stir;
+        this.stirHost.set([x, y, 1 / (r * r), dx, dy, this.h, 0, 0]);
+        queue.writeBuffer(this.stirBuf, 0, this.stirHost);
+      }
+
       const pass2 = encoder.beginComputePass({
         label: 'step-project-dye',
         timestampWrites: this.querySet
           ? { querySet: this.querySet, endOfPassWriteIndex: 1 }
           : undefined,
       });
+      // FIRST in pass2, which puts it after the copy that folded the advected
+      // velocity into uIn and before divergence reads it — i.e. exactly
+      // between advection and the projection, which is where a body force
+      // belongs. The bump is divergent by construction and the solve that
+      // follows is what turns it into motion the fluid can make; after
+      // subtract_* it would just be a leak the next step inherits.
+      if (this.stir) {
+        this.dispatch(pass2, this.stirPipeline, this.stirGroup, this.nx + 1, this.ny + 1);
+        this.stir = null;
+      }
       this.dispatch(pass2, this.divergencePipeline, this.divergenceGroup, this.nx, this.ny);
-      if (this.dirty) mg.recordCoarsenLabels(pass2);
+      if (this.dirty || this.labelsDirty) mg.recordCoarsenLabels(pass2);
       for (let c = 0; c < mg.cycles; c++) mg.recordVCycle(pass2, 0);
       this.dispatch(pass2, this.subtractUPipeline, this.subtractUGroup, this.nx + 1, this.ny);
       this.dispatch(pass2, this.subtractVPipeline, this.subtractVGroup, this.nx, this.ny + 1);
@@ -411,6 +498,7 @@ export class GpuStepper implements GpuStep {
       }
       queue.submit([encoder.finish()]);
       this.dirty = false;
+      this.labelsDirty = false;
 
       // Started, NOT awaited: this is the whole optimization. The caller gets
       // control back with the submit still executing, so the host's own frame

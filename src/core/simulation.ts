@@ -12,6 +12,7 @@ import {
   type Grid,
 } from './grid.ts';
 import { applyDyePatch, type DyePatch } from './dye.ts';
+import { applyStir, type Stir } from './stir.ts';
 import { Profiler } from './profiler.ts';
 import { cpuPressureSolver, type PressureSolver } from './pressureSolver.ts';
 import { subtractGradient } from './subtractGradient.ts';
@@ -48,6 +49,20 @@ export interface GpuStep {
   /** The scene's dye inlet, re-imposed on the device every step. Constant in
    *  time, so this is called once per reset rather than per frame. */
   setDyePatch(patch: DyePatch | null): void;
+  /**
+   * Labels changed under it — the interactive brush, and nothing else.
+   *
+   * Distinct from invalidate() on purpose. That says "the host holds truth
+   * for everything" and re-uploads every field, which mid-run would also
+   * overwrite the resident dye from a host mirror that is stale by design
+   * (see readDye) and wipe the picture. This uploads labels alone.
+   */
+  /** The brush's push for the next step, or null to leave the velocity alone.
+   *  Consumed by that step: a drag is one frame's displacement, not a state
+   *  that persists, so a stroke that stops moving stops pushing. */
+  setStir(stir: Stir | null): void;
+
+  setLabels(label: Uint8Array): void;
   /**
    * Copies the device's dye into the host arrays.
    *
@@ -223,6 +238,14 @@ export class Simulation {
   readonly params: SimulationParams;
 
   time = 0;
+  /**
+   * A stir to apply at the START of the next step — the mouse dragging through
+   * the fluid. Written by the host, cleared by step(): one frame's
+   * displacement, never a persistent state, so a stroke that stops moving
+   * stops pushing without anyone having to say so.
+   */
+  stir: Stir | null = null;
+
   /** Timestep the last step() actually used; 0 before the first step. */
   dt = 0;
   /** Sweeps the last pressure solve used, out of params.pressureIters. */
@@ -346,6 +369,29 @@ export class Simulation {
   }
 
   /**
+   * The host has edited `f.label` since the last step — the brush painting an
+   * obstacle into a running flow. Restores the invariants a label change
+   * implies, on whichever engine is driving.
+   *
+   * It is reset()'s commitLabels call, minus the reset: the same rule (a face
+   * bordering a solid stores the solid's velocity, non-fluid cells carry no
+   * pressure) re-established at an arbitrary moment rather than only at t = 0.
+   * Every kernel in the step rests on it — gpu/project.wgsl's divergence()
+   * reads faces without consulting labels at all on the strength of it — so a
+   * label edit that skipped this would show up as fluid quietly flowing
+   * through the new obstacle.
+   *
+   * commitLabels fixes the HOST fields, which is what the CPU path steps on;
+   * the device holds its own copies and setLabels tells it to do the same to
+   * those. Calling both is right on either engine, since the idle one's
+   * arrays are simply not read.
+   */
+  commitLabelEdits(): void {
+    commitLabels(this.g, this.f);
+    this.stepper?.setLabels(this.f.label);
+  }
+
+  /**
    * Largest face velocity — what bounds CFL, since the backtrace samples
    * faces. Not the cell-centred speed used for display.
    *
@@ -373,6 +419,10 @@ export class Simulation {
    */
   async step(): Promise<void> {
     const { g, f, params: p } = this;
+    // Taken ONCE, here, so the two engines cannot disagree about whether this
+    // frame's drag has been spent and a slow frame cannot apply it twice.
+    const stir = this.stir;
+    this.stir = null;
     this.perf.begin();
     const uMax = this.maxFaceSpeed();
     // scale/gradScale both carry dt, so they are rebuilt every step; hoisting
@@ -392,6 +442,7 @@ export class Simulation {
       // The residual is still computed HERE, on what actually came back —
       // that keeps it an honest check on the device's output, not an on-device
       // number vouching for itself.
+      this.stepper.setStir(stir);
       const keep = p.dyeDecay > 0 ? Math.exp(-p.dyeDecay * dt) : 1;
       this.iters = await this.stepper.step(f, p.scheme, dt, scale, gradScale, keep, this.perf);
       if (p.residualEvery > 0 && this.steps % p.residualEvery === 0)
@@ -401,6 +452,14 @@ export class Simulation {
       await this.advector.velocity(g, p.scheme, f.u, f.v, this.uNext, this.vNext, f.label, dt);
       [f.u, this.uNext] = [this.uNext, f.u];
       [f.v, this.vNext] = [this.vNext, f.v];
+      // Between advection and the projection, which is where a body force
+      // belongs: the bump is divergent by construction, and the solve that
+      // follows is what turns it into motion the fluid can actually make.
+      if (stir) applyStir(g, f.u, f.v, f.label, stir);
+      // The bump changed the largest face speed, and the CFL for this step was
+      // computed before it. Harmless — dt is already fixed and the next step
+      // rescans — but the cache must not outlive the field it summarizes.
+      this.uMax = null;
       this.perf.mark('advect');
 
       computeDivergence(g, f.u, f.v, this.div);
