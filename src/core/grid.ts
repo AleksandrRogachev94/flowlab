@@ -72,6 +72,14 @@ export interface Grid {
  */
 export const DYE_CHANNELS = 3;
 
+/**
+ * One number per dye channel. Named because three different knobs now take
+ * that shape — a fade rate, a buoyancy weight, the per-step keep factor — and
+ * a bare `[number, number, number]` in three files invites them to drift apart
+ * from DYE_CHANNELS.
+ */
+export type PerChannel = readonly [number, number, number];
+
 /** The MAC grid's storage. See the header comment for the layout/strides. */
 export interface Fields {
   p: FieldArray;

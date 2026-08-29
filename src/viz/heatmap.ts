@@ -1,5 +1,5 @@
 import type { FieldArray } from '../core/grid.ts';
-import type { Colormap } from './colormaps.ts';
+import { fireTone, type Colormap, type DyePalette } from './colormaps.ts';
 
 export type Normalization =
   /** map [min,max] of this frame's data onto [0,1] */
@@ -171,22 +171,29 @@ export class Heatmap {
     g: FieldArray,
     b: FieldArray,
     dest: CanvasRenderingContext2D,
-    opts: { smooth?: boolean } = {},
+    opts: { smooth?: boolean; palette?: DyePalette } = {},
   ): void {
     // The scale is fixed, so report it rather than leaving whatever the last
     // draw() happened to measure.
     this.lastMin = 0;
     this.lastMax = 1;
 
+    // Hoisted, not tested per pixel: this loop runs once per cell per frame.
+    const fire = opts.palette === 'fire';
     const d = this.img.data;
     for (let j = 0; j < this.ny; j++) {
       const row = this.ny - 1 - j;
       for (let i = 0; i < this.nx; i++) {
         const k = i + j * this.nx;
         const o = (i + row * this.nx) * 4;
-        d[o] = r[k] * 255;
-        d[o + 1] = g[k] * 255;
-        d[o + 2] = b[k] * 255;
+        if (fire) {
+          // Channel 0 is heat, channel 1 is soot — see colormaps.ts.
+          fireTone(r[k], g[k], d, o);
+        } else {
+          d[o] = r[k] * 255;
+          d[o + 1] = g[k] * 255;
+          d[o + 2] = b[k] * 255;
+        }
       }
     }
 

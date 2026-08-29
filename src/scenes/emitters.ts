@@ -24,8 +24,10 @@ import { inDyeCells, makeDyePatch } from '../core/dye.ts';
 import { idxU, type Grid } from '../core/grid.ts';
 import type { DyeSource, Seed } from '../core/simulation.ts';
 
-/** smoothstep, clamped. */
-function ramp(t: number): number {
+/** smoothstep, clamped. Exported for scenes/fire.ts, whose vent wants the
+ *  same soft edge for the same reason: a velocity or heat jump on a single
+ *  face seeds an instability far harder than the physics does. */
+export function ramp(t: number): number {
   const c = Math.min(Math.max(t, 0), 1);
   return c * c * (3 - 2 * c);
 }

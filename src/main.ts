@@ -506,6 +506,10 @@ function sceneById(id: string): Scene {
 function restart(): void {
   const scene = sceneById(state.scene);
   app.sim.params.dyeDecay = scene.decay ?? 0;
+  // Before reset(), which is what forwards it to the device — see
+  // Simulation.reset. Cleared on every other scene, or a switch out of the
+  // fire would leave the next one's dye lifting the fluid.
+  app.sim.params.buoyancy = scene.buoyancy ?? 0;
   app.sim.reset(sceneSpec(scene, dyeOf(scene, state.dye), app.sim.g));
   app.view.invalidateSolids();
 }
@@ -906,8 +910,12 @@ async function frame(): Promise<void> {
   // canvas on top is then cleared and carries only the solids and the arrows.
   const dyeOnDevice = state.view === 'dye' && app.sim.stepper !== null && app.gpu !== null;
   dyeCanvas.hidden = !dyeOnDevice;
-  if (dyeOnDevice) app.gpu!.dyeView.draw();
-  const maxSpeed = app.view.draw(ctx, app.sim, state.view, state.arrows, dyeOnDevice);
+  // The SCENE's, not a display setting: it says what the three channels mean,
+  // and both paths have to agree or switching engine would recolour the
+  // picture (viz/colormaps.ts).
+  const palette = sceneById(state.scene).palette ?? 'rgb';
+  if (dyeOnDevice) app.gpu!.dyeView.draw(palette);
+  const maxSpeed = app.view.draw(ctx, app.sim, state.view, state.arrows, dyeOnDevice, palette);
   // Only when something reads it: a full pass over every cell, and the status
   // line drops it otherwise. Simulation stops refreshing `div` at all in that
   // case — see residualEvery below.

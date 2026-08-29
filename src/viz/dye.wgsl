@@ -17,6 +17,11 @@ struct Params {
   /** The canvas backing store, in device pixels. */
   w: u32,
   h: u32,
+  /** viz/colormaps.ts's DYE_PALETTES index — 0 rgb, 1 fire. */
+  palette: u32,
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -55,6 +60,21 @@ fn sample(gx: f32, gy: f32, base: u32) -> f32 {
   return mix(lo, hi, ty);
 }
 
+/**
+ * viz/colormaps.ts's fireTone, on the device. The two are twins and must stay
+ * so — the 2D path draws this same scene on the CPU engine, and a palette that
+ * differed between them would look like the physics differed. That file
+ * carries the argument for the curve.
+ */
+const SMOKE_RGB = vec3<f32>(0.9, 0.36, 0.15);
+
+fn fireTone(t: f32, s: f32) -> vec3<f32> {
+  let a = clamp(t, 0.0, 1.0);
+  let t2 = t * t;
+  let flame = vec3<f32>(1.4 * t2, 1.15 * t2 * t, 1.25 * t2 * t2 * t);
+  return flame + SMOKE_RGB * s * (1.0 - a);
+}
+
 @fragment
 fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   // @builtin(position) is in framebuffer pixels with the origin at the TOP
@@ -66,10 +86,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let gx = clamp(fx * f32(params.nx) - 0.5, 0.0, f32(params.nx - 1u));
   let gy = clamp(fy * f32(params.ny) - 0.5, 0.0, f32(params.ny - 1u));
   let cells = params.nx * params.ny;
-  return vec4<f32>(
+  let q = vec3<f32>(
     sample(gx, gy, 0u),
     sample(gx, gy, cells),
     sample(gx, gy, 2u * cells),
-    1.0,
   );
+  // Channels straight to RGB unless the scene says they mean something else.
+  if (params.palette == 1u) { return vec4<f32>(fireTone(q.x, q.y), 1.0); }
+  return vec4<f32>(q, 1.0);
 }

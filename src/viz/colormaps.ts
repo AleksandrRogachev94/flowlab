@@ -91,3 +91,64 @@ export const grey = rampFromAnchors([
   [0.0, 0, 0, 0],
   [1.0, 255, 255, 255],
 ]);
+
+/* ------------------------------------------------------------ dye palettes */
+
+/**
+ * How the three dye channels become a colour.
+ *
+ * 'rgb'  channel 0/1/2 straight to R/G/B. The default, and the right one
+ *        wherever the channels are independent tracers: no colormap and no
+ *        normalization, so absolute brightness IS the measurement, and two
+ *        dyes interleaved below the cell scale mix to a colour neither was
+ *        seeded with — which is numerical diffusion made visible.
+ * 'fire' channel 0 is a TEMPERATURE and channel 1 is soot (see
+ *        core/buoyancy.ts). Straight RGB would render those as a red flame in
+ *        green smoke, which is not a mistake about the colours so much as
+ *        about what the field is: once a channel stops being a tracer and
+ *        starts being a state variable, the picture has to say what the state
+ *        MEANS.
+ */
+export const DYE_PALETTES = ['rgb', 'fire'] as const;
+export type DyePalette = (typeof DYE_PALETTES)[number];
+
+/** The index viz/dye.wgsl switches on. One table, so the shader and the 2D
+ *  path cannot disagree about which number is which palette. */
+export function paletteCode(p: DyePalette): number {
+  return DYE_PALETTES.indexOf(p);
+}
+
+/**
+ * Blackbody-ish emission plus grey absorption — the 'fire' palette, and the
+ * TWIN of the fs() branch in viz/dye.wgsl. The two must stay identical or the
+ * same scene looks different on the two engines, which is the same contract
+ * core/dye.ts's applyDyePatch has with its kernel.
+ *
+ * The flame is EMISSIVE and added; the smoke is absorptive and only shows
+ * where the flame is not. The rising powers on the three channels are what
+ * make one scalar read as a temperature: red appears first and saturates
+ * early, green follows, blue only near the top of the range, so the ramp runs
+ * dark red -> orange -> yellow -> white in the same order a real flame does.
+ * Nothing here is a fit to Planck's law; it is the cheapest curve with that
+ * ORDERING, which is the part the eye reads.
+ *
+ * The coefficients above 1 are deliberate over-range: the core clips to white,
+ * which is what stops a plume with a 1.0 source from looking like a flat
+ * orange blob.
+ *
+ * EVEN RED IS SUPERLINEAR, and that is a fix rather than taste. A linear red
+ * term means the long cool tail of the temperature field — which is most of
+ * the frame, since the heat outlives the flame by design — adds a few percent
+ * of red to every smoke cell, and the whole picture comes out dusty pink. At
+ * t^2 the tail contributes nothing visible and the flame keeps its edge.
+ */
+const SMOKE_RGB = [0.9, 0.36, 0.15] as const;
+
+export function fireTone(t: number, s: number, out: Uint8ClampedArray, i: number): void {
+  const a = t > 1 ? 1 : t > 0 ? t : 0;
+  const t2 = t * t;
+  // Uint8ClampedArray does the clamping, so nothing here has to.
+  out[i] = 255 * (1.4 * t2 + SMOKE_RGB[0] * s * (1 - a));
+  out[i + 1] = 255 * (1.15 * t2 * t + SMOKE_RGB[1] * s * (1 - a));
+  out[i + 2] = 255 * (1.25 * t2 * t2 * t + SMOKE_RGB[2] * s * (1 - a));
+}

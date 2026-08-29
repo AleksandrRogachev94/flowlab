@@ -2,7 +2,7 @@ import type { AdvectionScheme } from '../core/advect.ts';
 import { PATCH_PLANES, type DyePatch } from '../core/dye.ts';
 import type { FieldArray, Fields, Grid } from '../core/grid.ts';
 import { smooth, type Profiler } from '../core/profiler.ts';
-import type { GpuStep } from '../core/simulation.ts';
+import { isFading, type DyeKeep, type GpuStep } from '../core/simulation.ts';
 import type { Stir } from '../core/stir.ts';
 import type { GpuAdvector } from './advectGpu.ts';
 import type { GpuContext } from './device.ts';
@@ -76,10 +76,12 @@ const OUTFLOW_WORKGROUP = 64;
 /** project.wgsl's Params: nx, ny, divCoef, gradScale. */
 const PARAMS_BYTES = 16;
 
-/** project.wgsl's DyeParams: eight words, all of them named there. */
-const DYE_PARAMS_BYTES = 32;
+/** project.wgsl's DyeParams: twelve words, all of them named there. */
+const DYE_PARAMS_BYTES = 48;
 /** StirParams: eight floats, five used and three of padding. */
 const STIR_BYTES = 32;
+/** BuoyParams: four floats, three used and one of padding. */
+const BUOY_BYTES = 16;
 
 /** Must match CHANNELS in project.wgsl / DYE_CHANNELS in core/grid.ts. */
 const DYE_CHANNELS = 3;
@@ -103,6 +105,7 @@ export class GpuStepper implements GpuStep {
   private readonly dyeParamsF32 = new Float32Array(this.dyeParamsData);
 
   private readonly stirPipeline: GPUComputePipeline;
+  private readonly buoyancyPipeline: GPUComputePipeline;
   private readonly commitPipeline: GPUComputePipeline;
   private readonly divergencePipeline: GPUComputePipeline;
   private readonly subtractUPipeline: GPUComputePipeline;
@@ -112,6 +115,12 @@ export class GpuStepper implements GpuStep {
   private readonly patchPipeline: GPUComputePipeline;
   private readonly stirGroup: GPUBindGroup;
   private readonly stirBuf: GPUBuffer;
+  private readonly buoyancyGroup: GPUBindGroup;
+  private readonly buoyBuf: GPUBuffer;
+  private readonly buoyHost = new Float32Array(4);
+  /** The scene's weight — see GpuStep.setBuoyancy. 0 is every scene whose dye
+   *  is passive, and then the dispatch is skipped outright. */
+  private buoyancy = 0;
   private readonly commitGroup: GPUBindGroup;
   private readonly divergenceGroup: GPUBindGroup;
   private readonly subtractUGroup: GPUBindGroup;
@@ -190,6 +199,7 @@ export class GpuStepper implements GpuStep {
       usage: uniform,
     });
     this.stirBuf = device.createBuffer({ label: 'stir', size: STIR_BYTES, usage: uniform });
+    this.buoyBuf = device.createBuffer({ label: 'buoyancy', size: BUOY_BYTES, usage: uniform });
 
     const module = device.createShaderModule({ label: 'project', code: projectSource });
     const pipe = (entryPoint: string): GPUComputePipeline =>
@@ -200,6 +210,7 @@ export class GpuStepper implements GpuStep {
       });
     this.commitPipeline = pipe('commit_labels');
     this.stirPipeline = pipe('stir');
+    this.buoyancyPipeline = pipe('buoyancy');
     this.divergencePipeline = pipe('divergence');
     this.subtractUPipeline = pipe('subtract_u');
     this.subtractVPipeline = pipe('subtract_v');
@@ -224,6 +235,16 @@ export class GpuStepper implements GpuStep {
       { binding: 3, buffer: adv.uIn },
       { binding: 4, buffer: adv.vIn },
       { binding: 9, buffer: this.stirBuf },
+    ]);
+    // The one kernel that spans both grids: it writes a velocity face and
+    // reads the resident dye, hence both uniforms.
+    this.buoyancyGroup = this.group(this.buoyancyPipeline, [
+      { binding: 0, buffer: this.paramsBuf },
+      { binding: 1, buffer: adv.labelBuf },
+      { binding: 4, buffer: adv.vIn },
+      { binding: 6, buffer: adv.dyeIn },
+      { binding: 7, buffer: this.dyeParamsBuf },
+      { binding: 10, buffer: this.buoyBuf },
     ]);
     this.divergenceGroup = this.group(this.divergencePipeline, [
       { binding: 0, buffer: this.paramsBuf },
@@ -340,11 +361,23 @@ export class GpuStepper implements GpuStep {
     ]);
   }
 
+  /** See GpuStep.setBuoyancy. Stored rather than uploaded here: the kernel
+   *  wants w * dt and dt is not known until step() runs. */
+  setBuoyancy(w: number): void {
+    this.buoyancy = w;
+  }
+
   /** See GpuStep.readDye: the host mirror is stale while this path drives, and
    *  this is the one way to make it true again. */
   async readDye(dye: FieldArray[]): Promise<void> {
     if (this.busy) throw new Error('GpuStepper.readDye() during step()');
     if (this.ctx.lost) throw new Error('GPU device lost');
+    // Nothing to bring back: `dirty` means the HOST holds truth and the device
+    // still has whatever it was last given. Reading then would copy the old
+    // field over the new one — which is exactly what switching engine
+    // immediately after a scene change did, painting the previous scene's dye
+    // into the fresh one and leaving it there until the next reset.
+    if (this.dirty) return;
     const { adv } = this;
     const encoder = this.device.createCommandEncoder({ label: 'read-dye' });
     encoder.copyBufferToBuffer(adv.dyeIn, 0, adv.dyeRead, 0, adv.dyeLen * 4);
@@ -363,7 +396,7 @@ export class GpuStepper implements GpuStep {
     dt: number,
     scale: number,
     gradScale: number,
-    dyeKeep: number,
+    dyeKeep: DyeKeep,
     perf: Profiler,
   ): Promise<number> {
     if (this.busy) throw new Error('GpuStepper.step() is not re-entrant');
@@ -401,6 +434,7 @@ export class GpuStepper implements GpuStep {
       adv.writeParams(dt);
       this.writeParams(scale, gradScale);
       this.writeDyeParams(dyeKeep);
+      if (this.buoyancy !== 0) this.writeBuoyParams(dt);
       const t1 = performance.now();
       perf.mark('upload');
 
@@ -451,6 +485,15 @@ export class GpuStepper implements GpuStep {
         this.dispatch(pass2, this.stirPipeline, this.stirGroup, this.nx + 1, this.ny + 1);
         this.stir = null;
       }
+      // Alongside the stir and for the same reason: a body force belongs
+      // between advection and the projection. It reads dyeIn, which at this
+      // point still holds the END of the last step — advected, faded and
+      // re-sourced — which is exactly the field the CPU path's applyBuoyancy
+      // sees at the same seam. The fade later in this pass happens AFTER,
+      // where the host's does too.
+      if (this.buoyancy !== 0) {
+        this.dispatch(pass2, this.buoyancyPipeline, this.buoyancyGroup, this.nx, this.ny);
+      }
       this.dispatch(pass2, this.divergencePipeline, this.divergenceGroup, this.nx, this.ny);
       if (this.dirty || this.labelsDirty) mg.recordCoarsenLabels(pass2);
       for (let c = 0; c < mg.cycles; c++) mg.recordVCycle(pass2, 0);
@@ -463,7 +506,7 @@ export class GpuStepper implements GpuStep {
       // linearity argument in project.wgsl. Skipped outright when the scene
       // has no decay — keep is exactly 1 then, and multiplying 6M floats by
       // one is not free just because it is a no-op.
-      if (dyeKeep !== 1) {
+      if (isFading(dyeKeep)) {
         this.dispatch(
           pass2,
           this.decayPipeline,
@@ -606,16 +649,24 @@ export class GpuStepper implements GpuStep {
     this.device.queue.writeBuffer(this.paramsBuf, 0, this.paramsData);
   }
 
-  private writeDyeParams(keep: number): void {
+  private writeDyeParams(keep: DyeKeep): void {
     const p = this.patch;
     this.dyeParamsU32[0] = this.dg.nx;
     this.dyeParamsU32[1] = this.dg.ny;
-    this.dyeParamsF32[2] = keep;
-    this.dyeParamsU32[3] = p ? p.i0 : 0;
-    this.dyeParamsU32[4] = p ? p.j0 : 0;
-    this.dyeParamsU32[5] = p ? p.nx : 0;
-    this.dyeParamsU32[6] = p ? p.ny : 0;
+    this.dyeParamsF32[2] = keep[0];
+    this.dyeParamsF32[3] = keep[1];
+    this.dyeParamsF32[4] = keep[2];
+    this.dyeParamsU32[5] = p ? p.i0 : 0;
+    this.dyeParamsU32[6] = p ? p.j0 : 0;
+    this.dyeParamsU32[7] = p ? p.nx : 0;
+    this.dyeParamsU32[8] = p ? p.ny : 0;
     this.device.queue.writeBuffer(this.dyeParamsBuf, 0, this.dyeParamsData);
+  }
+
+  /** w * dt, plus the two cell sizes the kernel needs to cross the grids. */
+  private writeBuoyParams(dt: number): void {
+    this.buoyHost.set([this.buoyancy * dt, this.h, this.dg.h, 0]);
+    this.device.queue.writeBuffer(this.buoyBuf, 0, this.buoyHost);
   }
 
   /** See GpuAdvector.destroy. The field buffers belong to the advector and the
@@ -630,6 +681,7 @@ export class GpuStepper implements GpuStep {
     this.timeMap = null;
     this.paramsBuf.destroy();
     this.dyeParamsBuf.destroy();
+    this.buoyBuf.destroy();
     this.patchBuf?.destroy();
     this.queryResolve?.destroy();
     this.queryRead?.destroy();

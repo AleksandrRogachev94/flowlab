@@ -1,7 +1,7 @@
 import { Cell, idxP, type Grid } from '../core/grid.ts';
 import type { Simulation } from '../core/simulation.ts';
 import { computeVorticity } from '../core/vorticity.ts';
-import { coolwarm, iceFire, ocean } from './colormaps.ts';
+import { coolwarm, iceFire, ocean, type DyePalette } from './colormaps.ts';
 import { Heatmap } from './heatmap.ts';
 import { cellVelocity, defaultVectorOptions, drawVectors } from './vectors.ts';
 
@@ -120,6 +120,7 @@ export class FieldView {
     view: View,
     arrows = false,
     dyeOnDevice = false,
+    palette: DyePalette = 'rgb',
   ): number {
     const { g, f } = sim;
 
@@ -179,7 +180,7 @@ export class FieldView {
         // normalization: dye is seeded at 1 and only dissipates, so the
         // absolute brightness IS the measurement.
         const [r, gr, b] = f.dye;
-        this.dyeHeatmap.drawRGB(r, gr, b, ctx, { smooth: true });
+        this.dyeHeatmap.drawRGB(r, gr, b, ctx, { smooth: true, palette });
       }
     } else {
       // coolwarm keeps its near-white zero here: the debug question is "is

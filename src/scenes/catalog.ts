@@ -16,10 +16,12 @@
  * for two of them to end up composited on top of each other.
  */
 
-import type { Grid } from '../core/grid.ts';
+import type { Grid, PerChannel } from '../core/grid.ts';
 import type { DyeSeed, DyeSource, SceneSpec } from '../core/simulation.ts';
+import type { DyePalette } from '../viz/colormaps.ts';
 import { airfoilChannel, leadingEdgeY } from './airfoil.ts';
 import { wallJet } from './emitters.ts';
+import { draught, hotVent } from './plume.ts';
 import { centreY as karmanCentreY, karmanChannel } from './karman.ts';
 import { openRight } from './obstacles.ts';
 import { turbulenceGridChannel } from './turbulenceGrid.ts';
@@ -79,8 +81,24 @@ export interface Scene {
    * Dye fade, per second of sim time. Only recirculating scenes need it: a
    * permanent source in a closed box saturates every cell otherwise. Tune it
    * as a DISTANCE — k = speed / fadeLength.
+   *
+   * A triple sets it per channel, which is what a scene with a temperature in
+   * it needs: heat cools and soot does not.
    */
-  decay?: number;
+  decay?: number | PerChannel;
+  /**
+   * Buoyancy weight on dye channel 0 — see core/buoyancy.ts. Omitted on every
+   * scene whose dye is a passive tracer, which is all of them but one.
+   *
+   * A scene setting this is declaring that its channel 0 is a TEMPERATURE, and
+   * that is the one place the meaning lives: nothing in core/ knows what a
+   * channel is for, so this, `decay` and `palette` have to agree with each
+   * other and with the emitter that fills them.
+   */
+  buoyancy?: number;
+  /** How those channels become a colour. Defaults to straight RGB — see
+   *  viz/colormaps.ts. */
+  palette?: DyePalette;
 }
 
 /** Domain width in world units; the height is always 1 (h = 1/ny). */
@@ -199,12 +217,107 @@ const stripesIn: DyeOption = {
 // Seed and source come from one factory so they cannot disagree on the band.
 const jet = wallJet();
 
+/** The two-flame variant's vents, shared by its seed and its source for the
+ *  same reason `jet` is one object: two lists that must agree. */
+const TWIN = [0.36, 0.64];
+
 export const SCENES: Scene[] = [
   /**
-   * FIRST, so it is what the demo opens on. Every other scene is one body and
-   * its wake — legible, and quiet over most of the frame until you know what
-   * to look at. This one is moving everywhere from the first second, which is
-   * what a landing view has to be.
+   * The one scene where the dye is not passive: channel 0 is a TEMPERATURE, and
+   * `buoyancy` is what makes it lift the fluid carrying it (core/buoyancy.ts).
+   *
+   * WHY NOT "FIRE", which is what this was called and what it plainly looks
+   * like. There is no combustion here — no fuel, no reaction, no flame sheet.
+   * There is a strip of floor held hot and a body force proportional to
+   * temperature, and what that produces is a THERMAL PLUME: the same flow over
+   * a candle, a radiator, a chimney and a cumulus cloud. A real fire's visible
+   * shape IS its plume, so the picture is honest and the blurb can say so; the
+   * label should not claim chemistry the solver has never heard of. It also
+   * puts the scene in the same register as its neighbours, which are named for
+   * flows ("vortex street", "wall jet") and not for objects.
+   *
+   * THE ONLY SCENE WITH NO GEOMETRY AND NO IMPOSED FLOW, and that is the point
+   * of it rather than an omission. Every other scene here is a body in a
+   * stream — the flow is arranged at an inlet and the interest is in what the
+   * body does to it. This one has no inlet and no obstacle: the column, its
+   * flapping, the vortex rings peeling off it, the roll under the ceiling and
+   * the return flow down the walls are ALL the projection's answer to one body
+   * force. Putting a cylinder in front of it would only hand the eye something
+   * familiar to look at instead.
+   *
+   * The one velocity it is given is scenes/plume.ts's `draught`, and it is a
+   * TIE-BREAK rather than a flow: a few percent of plume speed, at box scale,
+   * written once. A perfectly mirror-symmetric box has a mirror-symmetric
+   * answer, and that answer is a straight column under one frozen mushroom cap
+   * — correct, and not a thing that happens in any room. That file argues the
+   * case; the short version is that suppressing the instability by exact
+   * symmetry is the artificial choice, not breaking it.
+   *
+   * An earlier version did exactly that, and it was worse in a way worth
+   * recording: a plume flaps, so it engages a fixed body on one side and then
+   * the other and never simply hits it, which reads as a misplaced obstacle
+   * rather than as an experiment. The brush is the better answer — the hint
+   * asks for a lid, and a lid you drew yourself is an experiment where a lid
+   * that shipped with the scene is furniture.
+   *
+   * THE TWO FADE RATES have to be read together with the vent:
+   *
+   *   decay [1.5, 0.1, 0]   the heat fades over ~a quarter of the box height at
+   *                         plume speed (k = speed / fadeLength), which is what
+   *                         keeps the bright core a FLAME shape rather than a hot column
+   *                         reaching the ceiling. The smoke lasts fifteen times
+   *                         as long, so it survives the whole rise, the roll
+   *                         under the ceiling and the return down the walls —
+   *                         and that gap is the whole reason dyeDecay had to
+   *                         become per-channel. Set the two equal and the
+   *                         second channel carries no information the first one
+   *                         does not.
+   *
+   *                         The smoke rate is also what decides how much of the
+   *                         FRAME carries anything: fade it as fast as the heat
+   *                         and the scene is a thread on black, which is a
+   *                         picture of the plume and not of the room it is
+   *                         stirring. Slow enough and the box fills with the
+   *                         2D inverse cascade the turbulence grid scene is
+   *                         about, for free, out of the same one force.
+   *   no outlet             convection needs no net boundary flux; see
+   *                         scenes/plume.ts.
+   */
+  {
+    id: 'plume',
+    label: 'Thermal plume',
+    blurb:
+      'Hot gas weighs less than the air around it, so it rises and drags the smoke with it — the plume over every fire.',
+    hint: 'Try a lid above the plume — it spreads underneath and rolls back down.',
+    // The one-time symmetry break, and the only velocity this scene is ever
+    // given — scenes/plume.ts says why a perfectly symmetric box produces a
+    // frozen mushroom instead of a flickering column.
+    build: () => ({ seed: draught() }),
+    dyes: [
+      { id: 'flame', label: 'One flame', source: () => hotVent() },
+      {
+        id: 'twin',
+        label: 'Twin flames',
+        source: () => hotVent({ centres: TWIN, halfWidth: 0.13, taper: 0.05 }),
+      },
+    ],
+    decay: [1.5, 0.1, 0],
+    buoyancy: 4,
+    palette: 'fire',
+  },
+  /**
+   * SECOND, and the pair at the top of this list is deliberate. Both fill the
+   * whole frame with motion, which is what a landing view has to do — every
+   * scene below is one body and its wake, legible but quiet over most of the
+   * picture until you know where to look. They fill it by opposite routes,
+   * and that is the argument for showing them together: the plume has no
+   * geometry and makes its structure out of one force, this one has eight rods
+   * and makes its structure out of them. The order between them is the order
+   * of stuff on the screen — nothing, then rods.
+   *
+   * The rest run outward from there: one body (vortex street), one body shaped
+   * on purpose (wing section), no body at all but a wall (wall jet), and then
+   * the two that are really velocity fields rather than experiments.
    */
   {
     id: 'grid',
@@ -232,17 +345,6 @@ export const SCENES: Scene[] = [
     dyes: [stripesIn, twoToneIn(() => 0.5), smokeIn, none],
   },
   {
-    id: 'jet',
-    label: 'Wall jet',
-    blurb: 'A nozzle in the left wall; the confined jet entrains and recirculates.',
-    hint: 'The emptiest scene — good one to build in.',
-    // openRight() is not optional: wallJet is pure inflow, so without an outlet
-    // the all-Neumann system is inconsistent and never converges.
-    build: () => ({ labels: openRight(), seed: jet.seed }),
-    dyes: [{ id: 'smoke', label: 'Smoke', source: () => jet.source }, none],
-    decay: 0.5,
-  },
-  {
     id: 'karman',
     label: 'Vortex street',
     blurb: 'Flow past a cylinder, shedding vortices left and right in turn.',
@@ -260,6 +362,17 @@ export const SCENES: Scene[] = [
     hint: 'Try a flap on the trailing edge, or a wall in front of the nose.',
     build: (g) => airfoilChannel(g),
     dyes: [stripesIn, twoToneIn(() => leadingEdgeY()), smokeIn, none],
+  },
+  {
+    id: 'jet',
+    label: 'Wall jet',
+    blurb: 'A nozzle in the left wall; the confined jet entrains and recirculates.',
+    hint: 'The emptiest scene — good one to build in.',
+    // openRight() is not optional: wallJet is pure inflow, so without an outlet
+    // the all-Neumann system is inconsistent and never converges.
+    build: () => ({ labels: openRight(), seed: jet.seed }),
+    dyes: [{ id: 'smoke', label: 'Smoke', source: () => jet.source }, none],
+    decay: 0.5,
   },
   {
     id: 'cluster',

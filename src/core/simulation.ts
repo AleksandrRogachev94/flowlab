@@ -1,5 +1,6 @@
 import type { AdvectionScheme } from './advect.ts';
 import { CpuAdvector, type Advector } from './advector.ts';
+import { applyBuoyancy, HEAT } from './buoyancy.ts';
 import { applyOutflow, commitLabels } from './boundaries.ts';
 import { computeDivergence } from './divergence.ts';
 import {
@@ -10,6 +11,7 @@ import {
   type FieldCtor,
   type Fields,
   type Grid,
+  type PerChannel,
 } from './grid.ts';
 import { applyDyePatch, type DyePatch } from './dye.ts';
 import { applyStir, type Stir } from './stir.ts';
@@ -37,9 +39,9 @@ export interface GpuStep {
     dt: number,
     scale: number,
     gradScale: number,
-    /** exp(-dyeDecay * dt), applied on the device — see the call site. 1 is
-     *  off, and is what a scene without decay passes. */
-    dyeKeep: number,
+    /** exp(-dyeDecay * dt) PER CHANNEL, applied on the device — see the call
+     *  site. All ones is off, and is what a scene without decay passes. */
+    dyeKeep: DyeKeep,
     perf: Profiler,
   ): Promise<number>;
   /** Host fields changed under it (reset, frames on a CPU solver); the next
@@ -49,6 +51,13 @@ export interface GpuStep {
   /** The scene's dye inlet, re-imposed on the device every step. Constant in
    *  time, so this is called once per reset rather than per frame. */
   setDyePatch(patch: DyePatch | null): void;
+
+  /**
+   * The scene's buoyancy weight on dye channel 0 — see core/buoyancy.ts.
+   * Constant in time like the inlet, so it is pushed once per reset; the dt
+   * the force needs is the one already handed to step().
+   */
+  setBuoyancy(w: number): void;
   /**
    * Labels changed under it — the interactive brush, and nothing else.
    *
@@ -164,8 +173,22 @@ export interface SimulationParams {
    * TIME sets the fade, not the number of steps taken to cover it. The scene
    * knob worth thinking in is a distance — dye fades to 1/e after travelling
    * U / dyeDecay, so pick that first and divide.
+   *
+   * PER CHANNEL when a triple is given, which is what buoyancy made necessary:
+   * once a channel is a temperature (see `buoyancy`), its fade is Newtonian
+   * cooling and the smoke channel beside it is soot that does not cool. One
+   * rate for both means either a plume that never stops accelerating or smoke
+   * that vanishes before it has drawn anything. A single number still applies
+   * to all three, which is every scene that has no temperature in it.
    */
-  dyeDecay: number;
+  dyeDecay: number | PerChannel;
+  /**
+   * Buoyancy weight on dye channel 0 — the Boussinesq force of
+   * core/buoyancy.ts, and the only thing in the step that makes the dye
+   * anything other than passive. Setting it is what declares that channel to
+   * be a temperature. 0 (the default) skips the kernel on both engines.
+   */
+  buoyancy: number;
   /**
    * Recompute the post-step residual (`div`) only every Nth step. 1 keeps it
    * exact, which is what the headless reference and the tests want.
@@ -206,8 +229,28 @@ export const defaultParams: SimulationParams = {
   omega: 0, // replaced by optimalOmega(nx, ny) in the constructor
   rho: 1.0,
   dyeDecay: 0,
+  buoyancy: 0,
   residualEvery: 1,
 };
+
+/**
+ * exp(-decay * dt) per channel: what a step multiplies the dye by, resolved
+ * from the scalar-or-triple knob so that nothing downstream — the host loop,
+ * the device uniform, the gputest — has to know which form the scene used.
+ */
+export type DyeKeep = PerChannel;
+
+export function dyeKeepFor(decay: number | PerChannel, dt: number): DyeKeep {
+  const k = (d: number): number => (d > 0 ? Math.exp(-d * dt) : 1);
+  if (typeof decay === 'number') return [k(decay), k(decay), k(decay)];
+  return [k(decay[0]), k(decay[1]), k(decay[2])];
+}
+
+/** Every channel unfaded — then the fade is skipped rather than multiplying
+ *  every dye cell by one. */
+export function isFading(keep: DyeKeep): boolean {
+  return keep[0] !== 1 || keep[1] !== 1 || keep[2] !== 1;
+}
 
 /**
  * One advect -> project loop over a MAC grid. No DOM (Rule 1), so it runs
@@ -361,6 +404,10 @@ export class Simulation {
     this.dyePatch = scene.dyeSource?.(this.dyeG, g) ?? null;
     if (this.dyePatch) applyDyePatch(this.dyeG, f.dye, this.dyePatch);
     this.stepper?.setDyePatch(this.dyePatch);
+    // Constant in time like the patch, and pushed on the same occasion: a
+    // scene change is the only thing that can move it, and main.ts writes it
+    // into params just before calling this.
+    this.stepper?.setBuoyancy(this.params.buoyancy);
     this.time = 0;
     this.dt = 0;
     this.uMax = null;
@@ -443,7 +490,7 @@ export class Simulation {
       // that keeps it an honest check on the device's output, not an on-device
       // number vouching for itself.
       this.stepper.setStir(stir);
-      const keep = p.dyeDecay > 0 ? Math.exp(-p.dyeDecay * dt) : 1;
+      const keep = dyeKeepFor(p.dyeDecay, dt);
       this.iters = await this.stepper.step(f, p.scheme, dt, scale, gradScale, keep, this.perf);
       if (p.residualEvery > 0 && this.steps % p.residualEvery === 0)
         computeDivergence(g, f.u, f.v, this.div);
@@ -456,6 +503,11 @@ export class Simulation {
       // belongs: the bump is divergent by construction, and the solve that
       // follows is what turns it into motion the fluid can actually make.
       if (stir) applyStir(g, f.u, f.v, f.label, stir);
+      // Same seam, same reason — see core/buoyancy.ts. It reads the dye from
+      // the END of the last step (advected, faded, re-sourced), which is what
+      // gpu/stepGpu.ts's kernel reads too; the two orderings are compared in
+      // that file's comment.
+      applyBuoyancy(g, this.dyeG, f.v, f.dye[HEAT], f.label, p.buoyancy, dt);
       // The bump changed the largest face speed, and the CFL for this step was
       // computed before it. Harmless — dt is already fixed and the next step
       // rescans — but the cache must not outlive the field it summarizes.
@@ -514,9 +566,13 @@ export class Simulation {
     // before or after the backtrace gives the same field. 6M multiplies a
     // frame is the difference, and at 1920x1080 that was the single most
     // expensive thing left on the host.
-    if (p.dyeDecay > 0 && !this.stepper) {
-      const keep = Math.exp(-p.dyeDecay * dt);
-      for (const c of f.dye) for (let k = 0; k < c.length; k++) c[k] *= keep;
+    if (!this.stepper) {
+      const keep = dyeKeepFor(p.dyeDecay, dt);
+      for (let c = 0; c < f.dye.length; c++) {
+        if (keep[c] === 1) continue;
+        const q = f.dye[c];
+        for (let k = 0; k < q.length; k++) q[k] *= keep[c];
+      }
     }
 
     // After advection, not before: the source must hold its value at the END

@@ -170,10 +170,17 @@ export class Controls {
     const sim = el('section');
     sim.append(
       el('h2', undefined, 'Simulation'),
-      row('Runs on', this.segmented('engine', spec.engines), 'G'),
-      el('p', 'note', 'CPU runs the same algorithm on one thread — the control, and slow.'),
+      // Resolution leads its section, and the engine toggle follows. Not by
+      // how often either is clicked — both are set once — but by how much is
+      // riding on being FOUND: the default is 'medium' and there are two
+      // settings above it, so a viewer who never opens this dropdown is
+      // watching a third of the grid their machine would carry. The engine
+      // toggle is the pedagogy, and someone who wants the control will look
+      // for it.
       row('Resolution', this.select('quality', spec.qualities)),
       el('p', 'note', 'The grid is rebuilt to fill the window, so resizing restarts the flow.'),
+      row('Runs on', this.segmented('engine', spec.engines), 'G'),
+      el('p', 'note', 'CPU runs the same algorithm on one thread — the control, and slow.'),
     );
 
     const advanced = el('details', 'advanced');

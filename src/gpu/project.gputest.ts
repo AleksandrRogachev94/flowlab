@@ -1,9 +1,10 @@
 /**
  * The correctness gate for project.wgsl, in the mould of the other two: run
  * every kernel in the file on real hardware and diff the results against their
- * f64 CPU originals — computeDivergence, subtractGradient, applyOutflow, the
- * dye fade Simulation.step applies, and core/dye.ts's applyDyePatch — on a
- * fixture with an interior solid and an Air outlet column.
+ * f64 CPU originals — core/buoyancy.ts's force, computeDivergence,
+ * subtractGradient, applyOutflow, the dye fade Simulation.step applies, and
+ * core/dye.ts's applyDyePatch — on a fixture with an interior solid and an Air
+ * outlet column.
  *
  * The dye_patch kernel matters here more than its size suggests. It is the
  * ONLY copy of an emitter that runs on the device, and its host twin is what
@@ -11,10 +12,11 @@
  * looking different on the two engines, which is exactly the comparison the
  * whole ladder exists to make.
  *
- * The dispatch ORDER matches stepGpu.ts — divergence first, then the
- * projection in place, then the outflow clamp — so the test also pins the one
- * ordering fact the fused step depends on: b is the divergence of the
- * PRE-projection velocity, read before subtract_* mutates it in the same pass.
+ * The dispatch ORDER matches stepGpu.ts — the body force, then divergence,
+ * then the projection in place, then the outflow clamp — so the test also pins
+ * the two ordering facts the fused step depends on: b is the divergence of the
+ * post-force, PRE-projection velocity, read before subtract_* mutates it in the
+ * same pass, and the buoyancy kernel reads the dye BEFORE the fade scales it.
  *
  * Needs Chrome and a GPU: `npm run test:gpu`.
  */
@@ -22,6 +24,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { applyOutflow } from '../core/boundaries.ts';
+import { applyBuoyancy } from '../core/buoyancy.ts';
 import { computeDivergence } from '../core/divergence.ts';
 import { applyDyePatch, makeDyePatch } from '../core/dye.ts';
 import { Cell, createGrid, idxP } from '../core/grid.ts';
@@ -36,7 +39,12 @@ const SCALE = 0.02;
 const GRAD_SCALE = 0.5;
 /** Deliberately not a round number, so a cell scaled twice or zero times is
  *  visible rather than coincidentally right. */
-const DYE_KEEP = 0.9137;
+const DYE_KEEP = [0.9137, 0.7213, 1.0431] as const;
+/** Not a round number, like DYE_KEEP: this is the one kernel that reads one
+ *  grid and writes another, so a transposed sample or a half-cell offset has
+ *  to show up as a number rather than as a wash. */
+const BUOY_W = 0.37;
+const BUOY_DT = 0.023;
 const DYE_CHANNELS = 3;
 /** The inlet: three columns, with a band of zero coverage so the lerp's
  *  "leave this cell alone" path is exercised rather than assumed. */
@@ -140,6 +148,7 @@ test('project.wgsl reproduces divergence, projection, outflow and the dye kernel
   const svPipe = pipe('subtract_v');
   const outPipe = pipe('outflow');
   const decayPipe = pipe('decay');
+  const buoyPipe = pipe('buoyancy');
   const patchPipe = pipe('dye_patch');
 
   const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
@@ -159,11 +168,19 @@ test('project.wgsl reproduces divergence, projection, outflow and the dye kernel
   // DyeParams. The dye grid IS the velocity grid here: this file pins the
   // kernels' arithmetic, and advect.gputest.ts is where the two grids come
   // apart.
-  const dyeParamsBuf = device.createBuffer({ size: 32, usage: U });
-  const dpd = new ArrayBuffer(32);
-  new Uint32Array(dpd).set([nx, ny, 0, 0, 0, ${PATCH_COLS}, ny]);
-  new Float32Array(dpd).set([${DYE_KEEP}], 2);
+  const dyeParamsBuf = device.createBuffer({ size: 48, usage: U });
+  const dpd = new ArrayBuffer(48);
+  new Uint32Array(dpd).set([nx, ny, 0, 0, 0, 0, 0, ${PATCH_COLS}, ny]);
+  new Float32Array(dpd).set(${JSON.stringify(Array.from(DYE_KEEP))}, 2);
   device.queue.writeBuffer(dyeParamsBuf, 0, dpd);
+
+  // BuoyParams: w * dt, then the two cell sizes. The dye grid IS the velocity
+  // grid here, so both are 1/ny.
+  const buoyParamsBuf = device.createBuffer({ size: 16, usage: U });
+  const bpd = new Float32Array(4);
+  const bh = 1 / ny;
+  bpd.set([${BUOY_W * BUOY_DT}, bh, bh]);
+  device.queue.writeBuffer(buoyParamsBuf, 0, bpd);
 
   const patchBuf = buf(${DYE_CHANNELS + 1} * ${PATCH_COLS} * ny);
   device.queue.writeBuffer(patchBuf, 0, new Float32Array(${JSON.stringify(list(patch.data))}));
@@ -182,11 +199,16 @@ test('project.wgsl reproduces divergence, projection, outflow and the dye kernel
   const svG = group(svPipe, [[0, paramsBuf], [1, labelBuf], [2, pBuf], [4, vBuf]]);
   const outG = group(outPipe, [[0, paramsBuf], [1, labelBuf], [3, uBuf], [4, vBuf]]);
   const decayG = group(decayPipe, [[6, dyeBuf], [7, dyeParamsBuf]]);
+  const buoyG = group(buoyPipe, [[0, paramsBuf], [1, labelBuf], [4, vBuf], [6, dyeBuf], [7, dyeParamsBuf], [10, buoyParamsBuf]]);
   const patchG = group(patchPipe, [[6, dyeBuf], [7, dyeParamsBuf], [8, patchBuf]]);
 
   const enc = device.createCommandEncoder();
   const pass = enc.beginComputePass();
   const gx = Math.ceil(nx / 8), gy = Math.ceil(ny / 8);
+  // FIRST, exactly as stepGpu.ts records it: a body force belongs between
+  // advection and the projection, and it must read the dye before decay() has
+  // touched it.
+  pass.setPipeline(buoyPipe); pass.setBindGroup(0, buoyG); pass.dispatchWorkgroups(gx, gy);
   pass.setPipeline(divPipe); pass.setBindGroup(0, divG); pass.dispatchWorkgroups(Math.ceil((nx + 1) / 8), gy);
   pass.setPipeline(suPipe); pass.setBindGroup(0, suG); pass.dispatchWorkgroups(Math.ceil((nx + 1) / 8), gy);
   pass.setPipeline(svPipe); pass.setBindGroup(0, svG); pass.dispatchWorkgroups(gx, Math.ceil((ny + 1) / 8));
@@ -229,8 +251,12 @@ test('project.wgsl reproduces divergence, projection, outflow and the dye kernel
   assert.equal(res.validation, null, `WebGPU validation error: ${res.validation}`);
   assert.deepEqual(res.diagnostics, [], 'shader compiled with diagnostics');
 
-  // The CPU reference, in the SAME order: b from the pre-projection velocity,
-  // then the in-place projection, then the clamp.
+  // The CPU reference, in the SAME order: the body force, then b from the
+  // (post-force) pre-projection velocity, then the in-place projection, then
+  // the clamp.
+  const cells = NX * NY;
+  // Channel 0 alone — core/buoyancy.ts's HEAT, and the plane the kernel reads.
+  applyBuoyancy(g, g, v, new Float64Array(dye.buffer, 0, cells), label, BUOY_W, BUOY_DT);
   const div = new Float64Array(NX * NY);
   computeDivergence(g, u, v, div);
   const bExp = Float64Array.from(div, (d) => -SCALE * d);
@@ -239,8 +265,7 @@ test('project.wgsl reproduces divergence, projection, outflow and the dye kernel
   // The dye half, in the same order the pass recorded it. A cell the 2D decay
   // dispatch missed comes back unscaled and a cell it hit twice comes back
   // squared; both are ~1e-2 off, four orders above the f32 floor below.
-  const dyeExp = Float64Array.from(dye, (q) => q * DYE_KEEP);
-  const cells = NX * NY;
+  const dyeExp = Float64Array.from(dye, (q, k) => q * DYE_KEEP[Math.floor(k / cells)]);
   const planes = Array.from(
     { length: DYE_CHANNELS },
     (_, c) => new Float64Array(dyeExp.buffer, c * cells * 8, cells),

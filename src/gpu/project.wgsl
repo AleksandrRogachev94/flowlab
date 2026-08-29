@@ -29,18 +29,44 @@ struct Params {
 struct DyeParams {
   nx: u32,
   ny: u32,
-  // exp(-dyeDecay * dt): the fade the host used to apply in its own loop over
-  // every dye cell. 1 when the scene has no decay, and then the host skips the
-  // dispatch entirely rather than multiplying 6M floats by one.
-  keep: f32,
+  // exp(-dyeDecay * dt), PER CHANNEL: the fade the host used to apply in its
+  // own loop over every dye cell. All ones when the scene has no decay, and
+  // then the host skips the dispatch entirely rather than multiplying 6M
+  // floats by one. Three scalars rather than a vec3 because a vec3 in a
+  // uniform aligns to 16 bytes and would push the rest of the struct around
+  // for nothing. Per channel because a temperature cools and the soot beside
+  // it does not — see SimulationParams.dyeDecay.
+  keep0: f32,
+  keep1: f32,
+  keep2: f32,
   // The scene's inlet, uploaded once per reset.
   pi0: u32,
   pj0: u32,
   pnx: u32,
   pny: u32,
-  // std140 rounds a uniform struct up to 16 bytes; naming the slot beats
+  // std140 rounds a uniform struct up to 16 bytes; naming the slots beats
   // letting the layout do it silently.
-  pad: u32,
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
+};
+
+/**
+ * core/buoyancy.ts's weights, with dt ALREADY FOLDED IN by the host — the
+ * kernel is then one dot product and needs no timestep of its own.
+ *
+ * Both cell sizes ride along because this is the one kernel that spans the two
+ * grids: it writes a velocity face and reads the dye, which may be stored
+ * finer (Simulation.dyeG).
+ */
+struct BuoyParams {
+  /** beta * dt, so the kernel multiplies once and knows no timestep. */
+  w: f32,
+  /** Velocity cell size — where the face being written actually sits. */
+  h: f32,
+  /** Dye cell size, h / dyeScale. */
+  dh: f32,
+  pad: f32,
 };
 
 /** core/stir.ts's brush, in WORLD units. `h` rides along because Params has no
@@ -77,6 +103,7 @@ struct StirParams {
 // `patch` because WGSL reserves that word.
 @group(0) @binding(8) var<storage, read> inlet: array<f32>;
 @group(0) @binding(9) var<uniform> stirParams: StirParams;
+@group(0) @binding(10) var<uniform> buoyParams: BuoyParams;
 
 const AIR: u32 = 1u;
 const SOLID: u32 = 2u;
@@ -270,7 +297,56 @@ fn outflow(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn decay(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= dyeParams.nx || gid.y >= dyeParams.ny * CHANNELS) { return; }
   let k = gid.x + gid.y * dyeParams.nx;
-  dye[k] = dye[k] * dyeParams.keep;
+  // Which plane this row fell in — the flat gid.y runs over all three end to
+  // end, so integer division by the plane height IS the channel index.
+  let c = gid.y / dyeParams.ny;
+  var keep = dyeParams.keep0;
+  if (c == 1u) { keep = dyeParams.keep1; } else if (c == 2u) { keep = dyeParams.keep2; }
+  dye[k] = dye[k] * keep;
+}
+
+// -------------------------------------------------------------- buoyancy
+//
+// core/buoyancy.ts on the device: v += dt * (w . dye) on every interior v
+// face, dispatched between advection and the divergence for the reason that
+// file gives. The weights arrive with dt already in them.
+
+/** grid.ts's clampedAxis, on the dye grid: (base index, fraction). */
+fn dyeAxis(pos: f32, count: u32) -> vec2<f32> {
+  let c = clamp(pos, 0.0, f32(count - 1u));
+  let i0 = min(floor(c), f32(count - 2u));
+  return vec2<f32>(i0, c - i0);
+}
+
+/** grid.ts's sampleP, on the HEAT plane — channel 0, matching core/buoyancy's
+ *  HEAT. The -0.5 on both axes is the world -> index conversion for a
+ *  CELL-CENTRED field; the host's comment on sampleP carries the derivation,
+ *  and the two must agree or the engines disagree about where the heat is. */
+fn sampleHeat(x: f32, y: f32) -> f32 {
+  let ax = dyeAxis(x / buoyParams.dh - 0.5, dyeParams.nx);
+  let ay = dyeAxis(y / buoyParams.dh - 0.5, dyeParams.ny);
+  let k = u32(ax.x) + u32(ay.x) * dyeParams.nx;
+  let lo = mix(dye[k], dye[k + 1u], ax.y);
+  let hi = mix(dye[k + dyeParams.nx], dye[k + dyeParams.nx + 1u], ax.y);
+  return mix(lo, hi, ay.y);
+}
+
+// Bounds are subtract_v's exactly — interior faces, nothing touching a solid —
+// for the same two reasons: an edge face is prescribed boundary data, and a
+// solid's faces store the solid's velocity. solidCell (in-domain only) rather
+// than solidOrOutside, matching stir() and the host's isSolidCell; inside
+// j in [1, ny-1] the two agree anyway.
+@compute @workgroup_size(8, 8)
+fn buoyancy(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= params.nx || gid.y == 0u || gid.y >= params.ny) { return; }
+  let i = i32(gid.x);
+  let j = i32(gid.y);
+  if (solidCell(i, j - 1) || solidCell(i, j)) { return; }
+  // The v face sits at ((i+0.5)h, jh) — sampled at its OWN position, not at a
+  // cell centre, which is the same rule stir() follows on a staggered grid.
+  let x = (f32(gid.x) + 0.5) * buoyParams.h;
+  let y = f32(gid.y) * buoyParams.h;
+  v[idxV(gid.x, gid.y)] += buoyParams.w * sampleHeat(x, y);
 }
 
 // ---------------------------------------------------------------- dye source

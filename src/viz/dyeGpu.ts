@@ -1,5 +1,6 @@
 import type { Grid } from '../core/grid.ts';
 import type { GpuContext } from '../gpu/device.ts';
+import { paletteCode, type DyePalette } from './colormaps.ts';
 import dyeSource from './dye.wgsl?raw';
 
 /**
@@ -23,8 +24,10 @@ import dyeSource from './dye.wgsl?raw';
  * grid is for.
  */
 
-/** nx, ny, w, h. */
-const PARAMS_BYTES = 16;
+/** nx, ny, w, h, palette, and three words of padding: a uniform struct's size
+ *  rounds up to 16 bytes, so naming the slack beats letting the layout add
+ *  it. */
+const PARAMS_BYTES = 32;
 
 export class DyeRenderer {
   private readonly device: GPUDevice;
@@ -85,12 +88,15 @@ export class DyeRenderer {
     if (this.canvas.height !== h) this.canvas.height = h;
   }
 
-  draw(): void {
+  /** `palette` is the SCENE's, not a display preference: it says what the
+   *  three channels mean — see viz/colormaps.ts. */
+  draw(palette: DyePalette = 'rgb'): void {
     this.fit();
     this.paramsData[0] = this.dg.nx;
     this.paramsData[1] = this.dg.ny;
     this.paramsData[2] = this.canvas.width;
     this.paramsData[3] = this.canvas.height;
+    this.paramsData[4] = paletteCode(palette);
     this.device.queue.writeBuffer(this.paramsBuf, 0, this.paramsData);
 
     const encoder = this.device.createCommandEncoder({ label: 'dye-view' });
