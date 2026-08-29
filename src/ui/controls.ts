@@ -133,7 +133,7 @@ export class Controls {
 
     // --- top bar: identity, the scene switcher, and the two verbs ----------
     const bar = el('div', 'topbar');
-    bar.append(el('div', 'brand', 'Stable Fluids'));
+    bar.append(el('div', 'brand', 'Flowlab'));
     bar.append(this.chipGroup('scene', spec.scenes));
 
     const right = el('div', 'topbar-right');
