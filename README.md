@@ -5,7 +5,7 @@ browser on WebGPU, with a CPU reference implementation used to validate every
 number the GPU produces.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/ca814ff9-86a8-430b-b482-f598fd75ddcc" alt="Flowlab demo — smoke curling off a vortex street" width="720">
+  <img src="https://github.com/user-attachments/assets/7f1f58b6-9a37-4976-9681-d872d9a01ac3" alt="Flowlab demo — smoke curling off a vortex street" width="720">
 </p>
 
 <p align="center">
